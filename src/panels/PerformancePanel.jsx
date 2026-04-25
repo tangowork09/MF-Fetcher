@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, Fragment } from 'react'
-import { api } from '../api'
 import { amfi } from '../amfi'
 import * as XLSX from 'xlsx'
 import { Panel, Field, Btn, ErrorBox, Skeleton, SectionHeader, SearchSelect, DatePicker } from '../components/ui'
@@ -88,6 +87,38 @@ function ColumnGroupFilter({ values, selected, onChange }) {
   )
 }
 
+function ReturnCell({ val }) {
+  if (val == null) return <td style={{ color: 'var(--text-faint)' }}>—</td>
+  return <td style={{ color: val >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{val.toFixed(2)}</td>
+}
+
+function SortTh({ col, filterKey, children, placeholder, groupKey, groupValues, sortCol, sortAsc, onSort, colFilters, onFilter, groupFilters, onGroupFilter }) {
+  return (
+    <th>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        <span onClick={() => onSort(col)} style={{ cursor: 'pointer', userSelect: 'none', flex: 1 }}>
+          {children} {sortCol === col ? (sortAsc ? '↑' : '↓') : ''}
+        </span>
+        {groupKey && groupValues && (
+          <ColumnGroupFilter
+            values={groupValues}
+            selected={groupFilters[groupKey]}
+            onChange={(sel) => onGroupFilter(groupKey, sel)}
+          />
+        )}
+      </div>
+      <input
+        className={styles.colFilter}
+        placeholder={placeholder || '...'}
+        value={colFilters[filterKey] || ''}
+        onChange={e => onFilter(filterKey, e.target.value)}
+        onClick={e => e.stopPropagation()}
+        style={{ marginTop: 4 }}
+      />
+    </th>
+  )
+}
+
 export default function PerformancePanel() {
   const [filters, setFilters] = useState(null)
   const [subcategories, setSubcategories] = useState([])
@@ -99,7 +130,6 @@ export default function PerformancePanel() {
   const [colFilters, setColFilters] = useState({})
   const [sortCol, setSortCol] = useState(null)
   const [sortAsc, setSortAsc] = useState(true)
-  const [schemeCodes, setSchemeCodes] = useState({})
   const [groupFilters, setGroupFilters] = useState({})
 
   const setFilter = (col, val) => setColFilters(prev => ({ ...prev, [col]: val }))
@@ -139,19 +169,6 @@ export default function PerformancePanel() {
     try {
       const data = await amfi.performance({ maturityType, category, subCategory, mfid, reportDate })
       setResults(data)
-      // Resolve scheme codes in background
-      const codes = {}
-      await Promise.all(data.slice(0, 50).map(async (r) => {
-        try {
-          const name = r.schemeName.split(' - ')[0].trim().split(' ').slice(0, 3).join(' ')
-          const res = await api.search(name)
-          if (Array.isArray(res)) {
-            const match = res.find(s => s.schemeName.includes('Direct') && s.schemeName.includes('Growth') && s.schemeName.toLowerCase().includes(r.schemeName.split(' ')[0].toLowerCase()))
-            if (match) codes[r.schemeName] = match.schemeCode
-          }
-        } catch {}
-      }))
-      setSchemeCodes(prev => ({ ...prev, ...codes }))
     } catch {
       setError('Failed to fetch performance data.')
     } finally { setLoading(false) }
@@ -212,7 +229,6 @@ export default function PerformancePanel() {
               {results && results.length > 0 && (
                 <Btn small onClick={() => {
                   const rows = results.map(r => ({
-                    Code: schemeCodes[r.schemeName] || '',
                     Scheme: r.schemeName, Benchmark: r.benchmark,
                     'NAV Direct': r.navDirect, 'AUM Cr': r.dailyAUM,
                     '1Y%': r.return1YearDirect, '3Y%': r.return3YearDirect,
@@ -256,16 +272,13 @@ export default function PerformancePanel() {
         }
 
         const filtered = results.filter(r => {
-          const code = schemeCodes[r.schemeName]
           return textMatch(r.schemeName, colFilters.scheme)
             && textMatch(r.benchmark, colFilters.benchmark)
-            && textMatch(code, colFilters.code)
             && numMatch(r.navDirect, colFilters.nav)
             && numMatch(r.dailyAUM, colFilters.aum)
             && returnCols.every(([label, , dir]) => numMatch(r[dir], colFilters[label]))
             && groupMatch(r.schemeName, 'g_scheme')
             && groupMatch(r.benchmark, 'g_benchmark')
-            && groupMatch(String(code ?? '—'), 'g_code')
             && groupMatch(r.navDirect != null ? r.navDirect.toFixed(2) : '—', 'g_nav')
             && groupMatch(r.dailyAUM != null ? r.dailyAUM.toFixed(0) : '—', 'g_aum')
             && returnCols.every(([label, , dir]) => groupMatch(r[dir] != null ? r[dir].toFixed(2) : '—', `g_${label}`))
@@ -282,35 +295,7 @@ export default function PerformancePanel() {
           else { setSortCol(col); setSortAsc(false) }
         }
 
-        const ReturnCell = ({ val }) => {
-          if (val == null) return <td style={{ color: 'var(--text-faint)' }}>—</td>
-          return <td style={{ color: val >= 0 ? 'var(--green)' : 'var(--red)', fontWeight: 600 }}>{val.toFixed(2)}</td>
-        }
-
-        const SortTh = ({ col, filterKey, children, placeholder, groupKey, groupValues }) => (
-          <th>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <span onClick={() => handleSort(col)} style={{ cursor: 'pointer', userSelect: 'none', flex: 1 }}>
-                {children} {sortCol === col ? (sortAsc ? '↑' : '↓') : ''}
-              </span>
-              {groupKey && groupValues && (
-                <ColumnGroupFilter
-                  values={groupValues}
-                  selected={groupFilters[groupKey]}
-                  onChange={(sel) => setGroupFilter(groupKey, sel)}
-                />
-              )}
-            </div>
-            <input
-              className={styles.colFilter}
-              placeholder={placeholder || '...'}
-              value={colFilters[filterKey] || ''}
-              onChange={e => setFilter(filterKey, e.target.value)}
-              onClick={e => e.stopPropagation()}
-              style={{ marginTop: 4 }}
-            />
-          </th>
-        )
+        const thProps = { sortCol, sortAsc, onSort: handleSort, colFilters, onFilter: setFilter, groupFilters, onGroupFilter: setGroupFilter }
 
         return (
           <div className={styles.section}>
@@ -318,7 +303,6 @@ export default function PerformancePanel() {
               <SendToExcel
                 name="Fund Performance"
                 data={sorted.map(r => ({
-                  Code: schemeCodes[r.schemeName] || '',
                   Scheme: r.schemeName,
                   Benchmark: r.benchmark,
                   'NAV Direct': r.navDirect?.toFixed(2),
@@ -335,13 +319,12 @@ export default function PerformancePanel() {
                 <thead>
                   <tr>
                     <th>#</th>
-                    <SortTh col="code" filterKey="code" placeholder="Code" groupKey="g_code" groupValues={results.map(r => String(schemeCodes[r.schemeName] ?? '—'))}>Code</SortTh>
-                    <SortTh col="schemeName" filterKey="scheme" placeholder="Scheme..." groupKey="g_scheme" groupValues={results.map(r => r.schemeName)}>Scheme</SortTh>
-                    <SortTh col="benchmark" filterKey="benchmark" placeholder="Bench..." groupKey="g_benchmark" groupValues={results.map(r => r.benchmark)}>Benchmark</SortTh>
-                    <SortTh col="navDirect" filterKey="nav" placeholder=">100" groupKey="g_nav" groupValues={results.map(r => r.navDirect != null ? r.navDirect.toFixed(2) : '—')}>NAV (D)</SortTh>
-                    <SortTh col="dailyAUM" filterKey="aum" placeholder=">1000" groupKey="g_aum" groupValues={results.map(r => r.dailyAUM != null ? r.dailyAUM.toFixed(0) : '—')}>AUM (Cr)</SortTh>
+                    <SortTh {...thProps} col="schemeName" filterKey="scheme" placeholder="Scheme..." groupKey="g_scheme" groupValues={results.map(r => r.schemeName)}>Scheme</SortTh>
+                    <SortTh {...thProps} col="benchmark" filterKey="benchmark" placeholder="Bench..." groupKey="g_benchmark" groupValues={results.map(r => r.benchmark)}>Benchmark</SortTh>
+                    <SortTh {...thProps} col="navDirect" filterKey="nav" placeholder=">100" groupKey="g_nav" groupValues={results.map(r => r.navDirect != null ? r.navDirect.toFixed(2) : '—')}>NAV (D)</SortTh>
+                    <SortTh {...thProps} col="dailyAUM" filterKey="aum" placeholder=">1000" groupKey="g_aum" groupValues={results.map(r => r.dailyAUM != null ? r.dailyAUM.toFixed(0) : '—')}>AUM (Cr)</SortTh>
                     {returnCols.map(([label, , dir]) => (
-                      <SortTh key={label} col={dir} filterKey={label} placeholder=">10" groupKey={`g_${label}`} groupValues={results.map(r => r[dir] != null ? r[dir].toFixed(2) : '—')}>{label} %</SortTh>
+                      <SortTh {...thProps} key={label} col={dir} filterKey={label} placeholder=">10" groupKey={`g_${label}`} groupValues={results.map(r => r[dir] != null ? r[dir].toFixed(2) : '—')}>{label} %</SortTh>
                     ))}
                   </tr>
                 </thead>
@@ -349,7 +332,6 @@ export default function PerformancePanel() {
                   {sorted.map((r, i) => (
                     <tr key={i}>
                       <td className={styles.rowNum}>{i + 1}</td>
-                      <td>{schemeCodes[r.schemeName] ? <span className={styles.schemeCode}>{schemeCodes[r.schemeName]}</span> : <span style={{ color: 'var(--text-faint)', fontSize: 10 }}>—</span>}</td>
                       <td>{r.schemeName}</td>
                       <td style={{ fontSize: 11, color: 'var(--text-dim)' }}>{r.benchmark}</td>
                       <td className={styles.navCell}>{r.navDirect?.toFixed(2)}</td>

@@ -410,24 +410,20 @@ function HistoryPanel(_, ref) {
                   {isAnyFiltered && (
                     <Btn onClick={handleBulkDownload}>⬇ Filtered ZIP</Btn>
                   )}
-                  <Btn onClick={async () => {
+                  <Btn onClick={() => {
                     const { header, fullRows, trimmedWithAth, rolling3yr, rolling5yr, betaSheet } = buildPivotData(results, filteredSubsets)
-                    const zip = new JSZip()
-                    const addCsv = (name, rows) => {
+                    const wb = XLSX.utils.book_new()
+                    const addSheet = (name, rows) => {
                       const ws = XLSX.utils.aoa_to_sheet(rows)
-                      zip.file(name, XLSX.utils.sheet_to_csv(ws))
+                      XLSX.utils.book_append_sheet(wb, ws, name.slice(0, 31))
                     }
-                    addCsv('bulk_full.csv', [header, ...fullRows])
-                    addCsv('bulk_trimmed_ath.csv', trimmedWithAth)
-                    addCsv('3yr_rolling_return.csv', rolling3yr)
-                    addCsv('5yr_rolling_return.csv', rolling5yr)
-                    addCsv('beta_std_dev.csv', betaSheet)
-                    const blob = await zip.generateAsync({ type: 'blob' })
-                    const url = URL.createObjectURL(blob)
-                    const a = document.createElement('a')
-                    a.href = url; a.download = 'bulk_analysis.zip'; a.click()
-                    setTimeout(() => URL.revokeObjectURL(url), 1000)
-                  }}>⬇ Analysis ZIP</Btn>
+                    addSheet('Full', [header, ...fullRows])
+                    addSheet('Trimmed + ATH', trimmedWithAth)
+                    addSheet('3yr Rolling Return', rolling3yr)
+                    addSheet('5yr Rolling Return', rolling5yr)
+                    addSheet('Beta & Std Dev', betaSheet)
+                    XLSX.writeFile(wb, 'bulk_analysis.xlsx')
+                  }}>⬇ Analysis .xlsx</Btn>
                   <Btn onClick={() => {
                     const { header, fullRows, trimmedWithAth, rolling3yr, rolling5yr, betaSheet } = buildPivotData(results, filteredSubsets)
                     webExcelStore.addSheet('Bulk (Full)', [header, ...fullRows], [])

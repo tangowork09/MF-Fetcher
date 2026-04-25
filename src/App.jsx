@@ -8,7 +8,7 @@ import PerformancePanel from './panels/PerformancePanel'
 const WebExcelPanel = lazy(() => import('./panels/WebExcelPanel'))
 import styles from './App.module.css'
 
-const TABS = ['Dashboard', 'Fund Performance', 'Browse All', 'Web Excel', 'Latest NAV', 'NAV History']
+const TABS = ['Dashboard', 'Fund Performance', 'Browse All', 'Web Excel']
 
 export default function App() {
   const [activeTab, setActiveTab] = useState(0)
@@ -79,10 +79,6 @@ export default function App() {
             <WebExcelPanel isVisible={activeTab === 3} />
           </Suspense>
         )}
-        {/* 4: Latest NAV */}
-        <div style={{ display: activeTab === 4 ? 'block' : 'none' }}><LatestPanel /></div>
-        {/* 5: NAV History */}
-        <div style={{ display: activeTab === 5 ? 'block' : 'none' }}><HistoryPanel /></div>
       </main>
     </div>
   )
