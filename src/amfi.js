@@ -1,7 +1,12 @@
-const BASE = '/amfi-api'
+const isDev = import.meta.env.DEV
 
 function post(endpoint, body = null) {
-  return fetch(`${BASE}/${endpoint}`, {
+  // Dev: use Vite proxy. Prod: use Vercel serverless function.
+  const url = isDev
+    ? `/amfi-api/${endpoint}`
+    : `/api/amfi?endpoint=${encodeURIComponent(endpoint)}`
+
+  return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
@@ -15,16 +20,9 @@ function post(endpoint, body = null) {
 }
 
 export const amfi = {
-  /** Get filter options: maturity types, categories, MF houses, report date */
   filters: () => post('fundperformancefilters'),
-
-  /** Check if a date is a holiday */
   isHoliday: (reportDate) => post('isHoliday', { reportDate }),
-
-  /** Get subcategories for a category ID */
   subcategories: (category) => post('getsubcategory', { category }),
-
-  /** Get fund performance data */
   performance: ({ maturityType, category, subCategory, mfid = 0, reportDate }) =>
     post('fundperformance', { maturityType, category, subCategory, mfid, reportDate }),
 }
