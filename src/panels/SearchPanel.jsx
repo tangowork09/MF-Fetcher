@@ -6,6 +6,34 @@ import { Panel, SearchBar, SectionHeader, Field, Btn, ErrorBox, Empty, SearchSel
 import SendToExcel from '../components/SendToExcel'
 import styles from '../App.module.css'
 
+function FilterableGroup({ group, ResultRow }) {
+  const [filter, setFilter] = useState('')
+  const filtered = filter
+    ? group.schemes.filter(r =>
+        r.schemeName.toLowerCase().includes(filter.toLowerCase()) ||
+        String(r.schemeCode).includes(filter)
+      )
+    : group.schemes
+
+  return (
+    <Accordion title={`${group.house} (${filtered.length}/${group.schemes.length})`}>
+      <input
+        className={styles.input}
+        placeholder="Filter schemes..."
+        value={filter}
+        onChange={e => setFilter(e.target.value)}
+        style={{ marginBottom: 8 }}
+      />
+      <div className={styles.resultList}>
+        {filtered.length === 0
+          ? <Empty msg="No match" />
+          : filtered.map(r => <ResultRow key={r.schemeCode} r={r} />)
+        }
+      </div>
+    </Accordion>
+  )
+}
+
 export default function SearchPanel({ onSchemeSelect, onAddToHistory, onRemoveFromHistory, historyCodes }) {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState(null)
@@ -24,6 +52,8 @@ export default function SearchPanel({ onSchemeSelect, onAddToHistory, onRemoveFr
   const [fundHouse, setFundHouse] = useState(0)
   const [browseLoading, setBrowseLoading] = useState(false)
   const [browseResults, setBrowseResults] = useState(null)
+  const [globalFilter, setGlobalFilter] = useState('')
+  const [selectedHouses, setSelectedHouses] = useState(null) // null = all
 
   useEffect(() => {
     amfi.filters().then(data => {
@@ -194,21 +224,77 @@ export default function SearchPanel({ onSchemeSelect, onAddToHistory, onRemoveFr
       )}
 
       {/* Browse results — grouped by fund house */}
-      {browseResults && (
-        <div className={styles.section}>
-          <SectionHeader label={`${browseResults.length} fund houses · ${browseResults.reduce((s, g) => s + g.schemes.length, 0)} schemes`} />
-          {browseResults.length === 0 && <Empty msg="No schemes found for selected filters" />}
-          <div className={styles.accordionStack}>
-            {browseResults.map(group => (
-              <Accordion key={group.house} title={`${group.house} (${group.schemes.length})`}>
-                <div className={styles.resultList}>
-                  {group.schemes.map(r => <ResultRow key={r.schemeCode} r={r} />)}
-                </div>
-              </Accordion>
-            ))}
+      {browseResults && (() => {
+        // Apply global filter across all groups
+        const filteredGroups = browseResults
+          .filter(g => !selectedHouses || selectedHouses.has(g.house))
+          .map(g => ({
+            ...g,
+            schemes: globalFilter
+              ? g.schemes.filter(r =>
+                  r.schemeName.toLowerCase().includes(globalFilter.toLowerCase()) ||
+                  String(r.schemeCode).includes(globalFilter)
+                )
+              : g.schemes,
+          }))
+          .filter(g => g.schemes.length > 0)
+
+        const totalSchemes = filteredGroups.reduce((s, g) => s + g.schemes.length, 0)
+        const allHouses = browseResults.map(g => g.house)
+
+        return (
+          <div className={styles.section}>
+            <SectionHeader label={`${filteredGroups.length} fund houses · ${totalSchemes} schemes`} />
+
+            {/* Global filters */}
+            <div className={styles.filterBar} style={{ flexDirection: 'column', gap: 8 }}>
+              <input
+                className={styles.input}
+                placeholder="Search all schemes across all fund houses..."
+                value={globalFilter}
+                onChange={e => setGlobalFilter(e.target.value)}
+              />
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                <span className={styles.label} style={{ marginRight: 4 }}>Fund Houses:</span>
+                <button
+                  className={`${styles.addToHistoryBtn} ${!selectedHouses ? styles.addedBadge : ''}`}
+                  onClick={() => setSelectedHouses(null)}
+                  style={!selectedHouses ? { background: 'var(--accent)', color: '#fff', borderColor: 'var(--accent)' } : {}}
+                >
+                  All ({allHouses.length})
+                </button>
+                {allHouses.map(h => {
+                  const active = selectedHouses?.has(h)
+                  return (
+                    <button
+                      key={h}
+                      className={styles.addToHistoryBtn}
+                      style={active ? { background: 'var(--accent)', color: '#fff', borderColor: 'var(--accent)' } : {}}
+                      onClick={() => {
+                        setSelectedHouses(prev => {
+                          const next = new Set(prev || allHouses)
+                          if (next.has(h)) next.delete(h)
+                          else next.add(h)
+                          return next.size === allHouses.length ? null : next.size === 0 ? new Set([h]) : next
+                        })
+                      }}
+                    >
+                      {h.split(' ')[0]}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            {filteredGroups.length === 0 && <Empty msg="No schemes match filters" />}
+            <div className={styles.accordionStack}>
+              {filteredGroups.map(group => (
+                <FilterableGroup key={group.house} group={group} ResultRow={ResultRow} />
+              ))}
+            </div>
           </div>
-        </div>
-      )}
+        )
+      })()}
     </Panel>
   )
 }
