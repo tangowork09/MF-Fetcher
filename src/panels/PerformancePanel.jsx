@@ -212,6 +212,7 @@ export default function PerformancePanel() {
               {results && results.length > 0 && (
                 <Btn small onClick={() => {
                   const rows = results.map(r => ({
+                    Code: schemeCodes[r.schemeName] || '',
                     Scheme: r.schemeName, Benchmark: r.benchmark,
                     'NAV Direct': r.navDirect, 'AUM Cr': r.dailyAUM,
                     '1Y%': r.return1YearDirect, '3Y%': r.return3YearDirect,
@@ -317,6 +318,7 @@ export default function PerformancePanel() {
               <SendToExcel
                 name="Fund Performance"
                 data={sorted.map(r => ({
+                  Code: schemeCodes[r.schemeName] || '',
                   Scheme: r.schemeName,
                   Benchmark: r.benchmark,
                   'NAV Direct': r.navDirect?.toFixed(2),

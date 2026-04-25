@@ -1194,6 +1194,26 @@
   font-family: var(--mono);
 }
 
+/* ── ACCORDION STACK (no gaps) ── */
+.accordionStack {
+  display: flex;
+  flex-direction: column;
+}
+.accordionStack .accordionWrap {
+  border-radius: 0;
+  border-bottom: none;
+}
+.accordionStack .accordionWrap:first-child {
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+.accordionStack .accordionWrap:last-child {
+  border-radius: 0 0 var(--radius) var(--radius);
+  border-bottom: 1px solid var(--border);
+}
+.accordionStack .accordionWrap:only-child {
+  border-radius: var(--radius);
+}
+
 /* ── ACCORDION ── */
 .accordionWrap {
   border: 1px solid var(--border);
