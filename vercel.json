@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/amfi-api/:path*", "destination": "/api/amfi-api/:path*" },
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
+  ]
+}
