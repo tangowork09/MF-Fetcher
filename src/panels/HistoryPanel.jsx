@@ -4,8 +4,261 @@ import { downloadBulkZip } from '../excel'
 import { Panel, SectionHeader, Field, Btn, ErrorBox, Accordion, SkeletonCard, Skeleton } from '../components/ui'
 import SendToExcel from '../components/SendToExcel'
 import { webExcelStore } from '../webExcelStore'
+import * as XLSX from 'xlsx'
 import NavResult from '../components/NavResult'
 import styles from '../App.module.css'
+
+function parseDDMMYYYY(s) {
+  const [d, m, y] = s.split('-')
+  return new Date(`${y}-${m}-${d}`)
+}
+
+function buildPivotData(results, filteredSubsets) {
+  const dateMap = new Map()
+  const schemeCols = []
+
+  results.forEach(r => {
+    const d = filteredSubsets[r.meta.scheme_code] || r.data
+    const colName = `${r.meta.scheme_code} - ${r.meta.scheme_name}`
+    schemeCols.push(colName)
+    d.forEach(row => {
+      if (!dateMap.has(row.date)) dateMap.set(row.date, {})
+      dateMap.get(row.date)[colName] = row.nav
+    })
+  })
+
+  const sortedDates = [...dateMap.keys()].sort((a, b) => parseDDMMYYYY(a) - parseDDMMYYYY(b))
+  const header = ['Date', ...schemeCols]
+
+  const fullRows = sortedDates.map(date => {
+    const entry = dateMap.get(date)
+    return [date, ...schemeCols.map(col => entry[col] ?? '')]
+  })
+
+  // Trimmed: find the latest start date across ALL schemes (where all have data)
+  // then remove all rows before that date
+  const startDates = results.map(r => {
+    const d = filteredSubsets[r.meta.scheme_code] || r.data
+    if (d.length === 0) return null
+    // Data might be desc or asc — find the earliest date
+    const dates = d.map(row => parseDDMMYYYY(row.date))
+    return new Date(Math.min(...dates))
+  }).filter(Boolean)
+
+  const latestStart = startDates.length > 0 ? new Date(Math.max(...startDates)) : null
+
+  const trimmedRows = latestStart
+    ? fullRows.filter(row => parseDDMMYYYY(row[0]) >= latestStart)
+    : fullRows
+
+  // All Time High for each scheme (from FULL data, not trimmed)
+  const athValues = schemeCols.map(col => {
+    let max = -Infinity
+    fullRows.forEach(row => {
+      const idx = schemeCols.indexOf(col) + 1
+      const val = parseFloat(row[idx])
+      if (!isNaN(val) && val > max) max = val
+    })
+    return max === -Infinity ? '' : max
+  })
+  const athRow = ['ALL TIME HIGH', ...athValues]
+
+  // Last date values (last row of full data = most recent date)
+  const lastRow = fullRows.length > 0 ? fullRows[fullRows.length - 1] : null
+  const lastDateRow = lastRow
+    ? [lastRow[0], ...schemeCols.map((_, i) => lastRow[i + 1])]
+    : ['LATEST', ...schemeCols.map(() => '')]
+
+  // % from ATH: ((ATH - latest) / ATH) * 100 = how far below ATH
+  const pctFromAth = ['% BELOW ATH', ...schemeCols.map((_, i) => {
+    const ath = parseFloat(athValues[i])
+    const latest = parseFloat(lastDateRow[i + 1])
+    if (isNaN(ath) || isNaN(latest) || ath === 0) return ''
+    const pct = ((ath - latest) / ath) * 100
+    return pct.toFixed(2) + '%'
+  })]
+
+  // Trimmed with ATH header: ATH, latest, % below, blank, header, data
+  const trimmedWithAth = [athRow, lastDateRow, pctFromAth, Array(header.length).fill(''), header, ...trimmedRows]
+
+  // Build NAV lookup for rolling calcs
+  const dateNavMap = {}
+  schemeCols.forEach((col, ci) => {
+    dateNavMap[col] = {}
+    trimmedRows.forEach(row => {
+      const nav = parseFloat(row[ci + 1])
+      if (!isNaN(nav)) {
+        dateNavMap[col][parseDDMMYYYY(row[0]).getTime()] = nav
+      }
+    })
+  })
+
+  function buildRollingSheet(years) {
+    const rows = []
+    const now = new Date()
+    now.setHours(0, 0, 0, 0)
+    const cutoff = new Date(now)
+    cutoff.setFullYear(cutoff.getFullYear() - years)
+
+    trimmedRows.forEach(row => {
+      const startDate = parseDDMMYYYY(row[0])
+      if (startDate > cutoff) return
+      const endDate = new Date(startDate)
+      endDate.setFullYear(endDate.getFullYear() + years)
+      const targetMs = endDate.getTime()
+
+      const returns = schemeCols.map(col => {
+        const startNav = dateNavMap[col][startDate.getTime()]
+        if (startNav == null || startNav === 0) return ''
+        let endNav = null
+        for (let offset = 0; offset <= 7; offset++) {
+          if (dateNavMap[col][targetMs + offset * 86400000] != null) { endNav = dateNavMap[col][targetMs + offset * 86400000]; break }
+          if (dateNavMap[col][targetMs - offset * 86400000] != null) { endNav = dateNavMap[col][targetMs - offset * 86400000]; break }
+        }
+        if (endNav == null) return ''
+        const cagr = (Math.pow(endNav / startNav, 1 / years) - 1) * 100
+        return cagr.toFixed(2) + '%'
+      })
+      if (returns.some(v => v !== '')) rows.push([row[0], ...returns])
+    })
+
+    const stats = schemeCols.map((_, ci) => {
+      const vals = rows.map(r => parseFloat(r[ci + 1])).filter(v => !isNaN(v)).sort((a, b) => a - b)
+      if (vals.length === 0) return { median: '', avg: '' }
+      const mid = Math.floor(vals.length / 2)
+      const median = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2
+      const avg = vals.reduce((s, v) => s + v, 0) / vals.length
+      return { median: median.toFixed(2) + '%', avg: avg.toFixed(2) + '%' }
+    })
+
+    const hdr = ['Date', ...schemeCols]
+    return [
+      ['MEDIAN', ...stats.map(s => s.median)],
+      ['AVERAGE', ...stats.map(s => s.avg)],
+      Array(hdr.length).fill(''),
+      hdr,
+      ...rows,
+    ]
+  }
+
+  const rolling3yr = buildRollingSheet(3)
+  const rolling5yr = buildRollingSheet(5)
+
+  // Beta & Std Deviation sheet
+  // 1. Build monthly NAV table (first available date each month)
+  const monthlyNavs = [] // [{ date, navs: [nav1, nav2, ...] }]
+  const seen = new Set()
+  trimmedRows.forEach(row => {
+    const d = parseDDMMYYYY(row[0])
+    const key = `${d.getFullYear()}-${d.getMonth()}`
+    if (seen.has(key)) return
+    seen.add(key)
+    const navs = schemeCols.map((_, ci) => parseFloat(row[ci + 1]))
+    monthlyNavs.push({ date: row[0], navs })
+  })
+
+  // 2. Monthly returns: ((current / previous) - 1) * 100
+  const monthlyReturns = monthlyNavs.map((m, i) => {
+    if (i === 0) return { date: m.date, returns: schemeCols.map(() => '') }
+    const prev = monthlyNavs[i - 1]
+    const returns = m.navs.map((nav, ci) => {
+      const prevNav = prev.navs[ci]
+      if (isNaN(nav) || isNaN(prevNav) || prevNav === 0) return ''
+      return ((nav / prevNav - 1) * 100).toFixed(4)
+    })
+    return { date: m.date, returns }
+  })
+
+  // 3. Std Dev for each scheme
+  const schemeReturnArrays = schemeCols.map((_, ci) =>
+    monthlyReturns.map(r => parseFloat(r.returns[ci])).filter(v => !isNaN(v))
+  )
+
+  function stddev(arr) {
+    if (arr.length < 2) return 0
+    const mean = arr.reduce((s, v) => s + v, 0) / arr.length
+    const variance = arr.reduce((s, v) => s + (v - mean) ** 2, 0) / (arr.length - 1)
+    return Math.sqrt(variance)
+  }
+
+  function correlation(a, b) {
+    if (a.length !== b.length || a.length < 2) return 0
+    const meanA = a.reduce((s, v) => s + v, 0) / a.length
+    const meanB = b.reduce((s, v) => s + v, 0) / b.length
+    let num = 0, denA = 0, denB = 0
+    for (let i = 0; i < a.length; i++) {
+      const da = a[i] - meanA, db = b[i] - meanB
+      num += da * db
+      denA += da * da
+      denB += db * db
+    }
+    const den = Math.sqrt(denA * denB)
+    return den === 0 ? 0 : num / den
+  }
+
+  // 4. Market = equal-weighted average of all schemes' monthly returns
+  const marketReturns = []
+  for (let i = 0; i < monthlyReturns.length; i++) {
+    const vals = schemeReturnArrays.map(arr => arr[i]).filter(v => v !== undefined && !isNaN(v))
+    marketReturns.push(vals.length > 0 ? vals.reduce((s, v) => s + v, 0) / vals.length : 0)
+  }
+  // Align lengths — market starts from index where returns exist
+  const validMarket = marketReturns.filter((_, i) => i > 0).slice(0)
+  const marketStdDev = stddev(validMarket)
+
+  const schemeStats = schemeCols.map((_, ci) => {
+    const returns = schemeReturnArrays[ci]
+    const sd = stddev(returns)
+    // Align scheme returns with market for correlation
+    const aligned = []
+    const alignedMarket = []
+    let mIdx = 0
+    monthlyReturns.forEach((r, i) => {
+      if (i === 0) return
+      const val = parseFloat(r.returns[ci])
+      if (!isNaN(val)) {
+        aligned.push(val)
+        alignedMarket.push(validMarket[mIdx] ?? 0)
+      }
+      mIdx++
+    })
+    const corr = correlation(aligned, alignedMarket)
+    const beta = marketStdDev > 0 ? corr * (sd / marketStdDev) : 0
+    return { sd: sd.toFixed(4), corr: corr.toFixed(4), beta: beta.toFixed(4) }
+  })
+
+  // 5. Build the sheet: stats rows, blank, two side-by-side tables
+  const betaHeader = ['', ...schemeCols]
+  const corrRow = ['CORRELATION', ...schemeStats.map(s => s.corr)]
+  const betaRow = ['BETA', ...schemeStats.map(s => s.beta)]
+  const sdRow = ['STD DEVIATION', ...schemeStats.map(s => s.sd)]
+  const blank = Array(betaHeader.length).fill('')
+
+  // Monthly NAV table + Monthly Return table side by side
+  const navHeader = ['Date (NAV)', ...schemeCols]
+  const retHeader = ['Date (Return %)', ...schemeCols]
+  const combinedHeader = [...navHeader, '', ...retHeader]
+  const maxRows = monthlyNavs.length
+  const betaSheetRows = [
+    ['CORRELATION', ...schemeStats.map(s => s.corr), '', 'CORRELATION', ...schemeStats.map(s => s.corr)],
+    ['BETA', ...schemeStats.map(s => s.beta), '', 'BETA', ...schemeStats.map(s => s.beta)],
+    ['STD DEVIATION', ...schemeStats.map(s => s.sd), '', 'STD DEVIATION', ...schemeStats.map(s => s.sd)],
+    Array(combinedHeader.length).fill(''),
+    combinedHeader,
+  ]
+
+  for (let i = 0; i < maxRows; i++) {
+    const nav = monthlyNavs[i]
+    const ret = monthlyReturns[i]
+    const navCells = [nav.date, ...nav.navs.map(v => isNaN(v) ? '' : v)]
+    const retCells = [ret.date, ...ret.returns]
+    betaSheetRows.push([...navCells, '', ...retCells])
+  }
+
+  const betaSheet = betaSheetRows
+
+  return { header, fullRows, trimmedRows, trimmedWithAth, athRow, rolling3yr, rolling5yr, betaSheet, latestStart }
+}
 
 /**
  * Single Responsibility: fetch and display NAV history for multiple schemes.
@@ -152,31 +405,27 @@ function HistoryPanel(_, ref) {
               label={`${results.length} Schemes Loaded`}
               action={
                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                  <Btn onClick={() => downloadBulkZip(results)}>⬇ Download Bulk (ZIP)</Btn>
+                  <Btn onClick={() => downloadBulkZip(results)}>⬇ Bulk ZIP</Btn>
                   {isAnyFiltered && (
-                    <Btn onClick={handleBulkDownload}>⬇ Download Filtered Bulk Data</Btn>
+                    <Btn onClick={handleBulkDownload}>⬇ Filtered ZIP</Btn>
                   )}
                   <Btn onClick={() => {
-                    // Build pivoted sheet: Date | Scheme1 NAV | Scheme2 NAV | ...
-                    const dateMap = new Map()
-                    const schemeCols = []
-                    results.forEach(r => {
-                      const d = filteredSubsets[r.meta.scheme_code] || r.data
-                      const colName = `${r.meta.scheme_code} - ${r.meta.scheme_name}`
-                      schemeCols.push(colName)
-                      d.forEach(row => {
-                        if (!dateMap.has(row.date)) dateMap.set(row.date, {})
-                        dateMap.get(row.date)[colName] = row.nav
-                      })
-                    })
-                    const parseDDMMYYYY = (s) => { const [d,m,y] = s.split('-'); return new Date(`${y}-${m}-${d}`) }
-                    const sortedDates = [...dateMap.keys()].sort((a, b) => parseDDMMYYYY(a) - parseDDMMYYYY(b))
-                    const header = ['Date', ...schemeCols]
-                    const rows = sortedDates.map(date => {
-                      const entry = dateMap.get(date)
-                      return [date, ...schemeCols.map(col => entry[col] ?? '')]
-                    })
-                    webExcelStore.addSheet('Bulk Worksheet', [header, ...rows], [])
+                    const { trimmedWithAth } = buildPivotData(results, filteredSubsets)
+                    const ws = XLSX.utils.aoa_to_sheet(trimmedWithAth)
+                    const csv = XLSX.utils.sheet_to_csv(ws)
+                    const blob = new Blob([csv], { type: 'text/csv' })
+                    const url = URL.createObjectURL(blob)
+                    const a = document.createElement('a')
+                    a.href = url; a.download = 'bulk_trimmed.csv'; a.click()
+                    setTimeout(() => URL.revokeObjectURL(url), 1000)
+                  }}>⬇ Trimmed CSV</Btn>
+                  <Btn onClick={() => {
+                    const { header, fullRows, trimmedWithAth, rolling3yr, rolling5yr, betaSheet } = buildPivotData(results, filteredSubsets)
+                    webExcelStore.addSheet('Bulk (Full)', [header, ...fullRows], [])
+                    webExcelStore.addSheet('Bulk (Trimmed + ATH)', trimmedWithAth, [])
+                    webExcelStore.addSheet('3yr Rolling Return', rolling3yr, [])
+                    webExcelStore.addSheet('5yr Rolling Return', rolling5yr, [])
+                    webExcelStore.addSheet('Beta & Std Dev', betaSheet, [])
                   }}>📊 To Excel</Btn>
                 </div>
               }

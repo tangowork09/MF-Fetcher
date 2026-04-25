@@ -1,8 +1,7 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
-import { api } from '../api'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import { amfi } from '../amfi'
 import { downloadSearchResultsExcel } from '../excel'
-import { Panel, SearchBar, SectionHeader, Field, Btn, ErrorBox, Empty, SearchSelect, Accordion } from '../components/ui'
+import { Panel, SearchBar, SectionHeader, Field, Btn, ErrorBox, Empty, SearchSelect, Accordion, Skeleton } from '../components/ui'
 import SendToExcel from '../components/SendToExcel'
 import styles from '../App.module.css'
 
@@ -35,14 +34,13 @@ function FilterableGroup({ group, ResultRow }) {
 }
 
 export default function SearchPanel({ onSchemeSelect, onAddToHistory, onRemoveFromHistory, historyCodes }) {
+  const [allSchemes, setAllSchemes] = useState([])
+  const [schemesLoading, setSchemesLoading] = useState(true)
   const [query, setQuery] = useState('')
-  const [results, setResults] = useState(null)
-  const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [selected, setSelected] = useState(null)
   const [codeFilter, setCodeFilter] = useState('')
   const [nameFilter, setNameFilter] = useState('')
-  const debounce = useRef(null)
 
   // AMFI category filters
   const [amfiFilters, setAmfiFilters] = useState(null)
@@ -50,11 +48,22 @@ export default function SearchPanel({ onSchemeSelect, onAddToHistory, onRemoveFr
   const [category, setCategory] = useState(0)
   const [subCategory, setSubCategory] = useState(0)
   const [fundHouse, setFundHouse] = useState(0)
-  const [browseLoading, setBrowseLoading] = useState(false)
   const [browseResults, setBrowseResults] = useState(null)
   const [globalFilter, setGlobalFilter] = useState('')
-  const [selectedHouses, setSelectedHouses] = useState(null) // null = all
+  const [selectedHouses, setSelectedHouses] = useState(null)
 
+  // Load ALL schemes once
+  useEffect(() => {
+    fetch('https://api.mfapi.in/mf')
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data)) setAllSchemes(data)
+      })
+      .catch(() => setError('Failed to load scheme list'))
+      .finally(() => setSchemesLoading(false))
+  }, [])
+
+  // Load AMFI filters
   useEffect(() => {
     amfi.filters().then(data => {
       setAmfiFilters(data)
@@ -70,71 +79,54 @@ export default function SearchPanel({ onSchemeSelect, onAddToHistory, onRemoveFr
     }).catch(() => {})
   }, [category])
 
-  useEffect(() => () => clearTimeout(debounce.current), [])
+  // Client-side search — split into words, match ALL independently
+  const searchResults = useMemo(() => {
+    if (!query.trim() || allSchemes.length === 0) return null
+    const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 0)
+    return allSchemes.filter(s => {
+      const name = (s.schemeName || '').toLowerCase()
+      const code = String(s.schemeCode)
+      return words.every(w => name.includes(w) || code.includes(w))
+    })
+  }, [query, allSchemes])
 
-  const runSearch = useCallback(async (q) => {
-    if (!q.trim()) { setResults(null); return }
-    setLoading(true); setError(null)
-    try {
-      const data = await api.search(q)
-      setResults(Array.isArray(data) ? data : [])
-    } catch {
-      setError('Failed to fetch. Check your connection.')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  const handleInput = (e) => {
-    const val = e.target.value
-    setQuery(val)
-    clearTimeout(debounce.current)
-    debounce.current = setTimeout(() => runSearch(val), 400)
-  }
-
-  // Browse by category — search each fund house
-  const runBrowse = async () => {
-    setBrowseLoading(true); setError(null); setBrowseResults(null)
-    try {
-      let houses = []
-      if (fundHouse) {
-        // Specific fund house
-        const found = amfiFilters?.mutualFundList.find(m => m.id === fundHouse)
-        if (found) houses = [found]
-      } else {
-        // All fund houses
-        houses = amfiFilters?.mutualFundList || []
-      }
-
-      const subCatName = subcategories.find(s => s.id === subCategory)?.name || ''
-      const catName = amfiFilters?.investmentTypeList.find(c => c.id === category)?.name || ''
-      const searchTerm = subCatName || catName
-
-      // Search each fund house name + category
-      const grouped = []
-      await Promise.all(houses.map(async (house) => {
-        try {
-          const q = `${house.name.split(' ')[0]} ${searchTerm}`.trim()
-          const data = await api.search(q)
-          if (Array.isArray(data) && data.length > 0) {
-            grouped.push({ house: house.name, schemes: data })
-          }
-        } catch {}
-      }))
-
-      grouped.sort((a, b) => a.house.localeCompare(b.house))
-      setBrowseResults(grouped)
-    } catch {
-      setError('Browse failed.')
-    } finally { setBrowseLoading(false) }
-  }
-
-  const filteredResults = results ? results.filter(r => {
+  const filteredResults = searchResults ? searchResults.filter(r => {
     const cMatch = (r.schemeCode || '').toString().toLowerCase().includes(codeFilter.toLowerCase())
     const nMatch = (r.schemeName || '').toString().toLowerCase().includes(nameFilter.toLowerCase())
     return cMatch && nMatch
   }) : []
   const isFiltered = codeFilter || nameFilter
+
+  // Browse by category — filter from local data
+  const runBrowse = () => {
+    if (allSchemes.length === 0) return
+    const subCatName = subcategories.find(s => s.id === subCategory)?.name?.split(' ')[0]?.toLowerCase() || ''
+
+    let houses = []
+    if (fundHouse) {
+      const found = amfiFilters?.mutualFundList.find(m => m.id === fundHouse)
+      if (found) houses = [found]
+    } else {
+      houses = amfiFilters?.mutualFundList || []
+    }
+
+    const grouped = []
+    houses.forEach(house => {
+      const cleanName = house.name.replace(/\s*mutual\s*fund\s*/gi, ' ').trim().toLowerCase()
+      const schemes = allSchemes.filter(s => {
+        const name = s.schemeName?.toLowerCase() || ''
+        const matchesHouse = cleanName.split(' ').some(word => word.length > 2 && name.includes(word))
+        const matchesCat = !subCatName || name.includes(subCatName)
+        return matchesHouse && matchesCat
+      })
+      if (schemes.length > 0) {
+        grouped.push({ house: house.name, schemes })
+      }
+    })
+
+    grouped.sort((a, b) => a.house.localeCompare(b.house))
+    setBrowseResults(grouped)
+  }
 
   const ResultRow = ({ r }) => (
     <div
@@ -159,142 +151,147 @@ export default function SearchPanel({ onSchemeSelect, onAddToHistory, onRemoveFr
   )
 
   return (
-    <Panel title="Search Schemes" subtitle="Search by name or browse by category">
-      <SearchBar
-        value={query}
-        onChange={handleInput}
-        placeholder="e.g. HDFC, SBI, Mirae Asset, Axis..."
-        loading={loading}
-      />
-
-      {error && <ErrorBox msg={error} />}
-
-      {/* Search results */}
-      {results !== null && (
-        <div className={styles.section}>
-          <div className={styles.filterBar}>
-            <Field label="Filter Code">
-              <input className={styles.input} placeholder="e.g. 125" value={codeFilter} onChange={e => setCodeFilter(e.target.value)} />
-            </Field>
-            <Field label="Filter Name">
-              <input className={styles.input} placeholder="e.g. Axis" value={nameFilter} onChange={e => setNameFilter(e.target.value)} />
-            </Field>
-          </div>
-          <SectionHeader
-            label={`${filteredResults.length} results`}
-            action={
-              filteredResults.length > 0 && (
-                <div className={styles.actions}>
-                  <Btn small onClick={() => downloadSearchResultsExcel(filteredResults)}>⬇ Excel</Btn>
-                  <SendToExcel name="Search Results" data={filteredResults.map(r => ({ 'Scheme Code': r.schemeCode, 'Scheme Name': r.schemeName }))} />
-                </div>
-              )
-            }
+    <Panel title="Search Schemes" subtitle={`${allSchemes.length.toLocaleString()} schemes loaded · instant search`}>
+      {schemesLoading ? (
+        <Skeleton lines={3} />
+      ) : (
+        <>
+          <SearchBar
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            placeholder="Search by name or code..."
+            loading={schemesLoading}
           />
-          <div className={styles.resultList}>
-            {filteredResults.length === 0
-              ? <Empty msg="No schemes match filters" />
-              : filteredResults.map(r => <ResultRow key={r.schemeCode} r={r} />)
-            }
-          </div>
-        </div>
-      )}
 
-      {/* Category browse filters */}
-      {amfiFilters && (
-        <div className={styles.section}>
-          <SectionHeader label="Browse by Category" />
-          <div className={styles.filterBar} style={{ flexDirection: 'column', gap: 8 }}>
-            <div style={{ display: 'flex', gap: 8, width: '100%' }}>
-              <Field label="Category">
-                <SearchSelect options={[{ id: 0, name: 'Select...' }, ...amfiFilters.investmentTypeList]} value={category} onChange={setCategory} placeholder="Category..." />
-              </Field>
-              <Field label="Sub Category">
-                <SearchSelect options={[{ id: 0, name: 'All' }, ...subcategories]} value={subCategory} onChange={setSubCategory} placeholder="Sub category..." />
-              </Field>
-            </div>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', width: '100%' }}>
-              <Field label="Fund House">
-                <SearchSelect options={[{ id: 0, name: 'All Fund Houses' }, ...amfiFilters.mutualFundList]} value={fundHouse} onChange={setFundHouse} placeholder="Fund house..." />
-              </Field>
-              <Btn small onClick={runBrowse} loading={browseLoading}>Browse</Btn>
-            </div>
-          </div>
-        </div>
-      )}
+          {error && <ErrorBox msg={error} />}
 
-      {/* Browse results — grouped by fund house */}
-      {browseResults && (() => {
-        // Apply global filter across all groups
-        const filteredGroups = browseResults
-          .filter(g => !selectedHouses || selectedHouses.has(g.house))
-          .map(g => ({
-            ...g,
-            schemes: globalFilter
-              ? g.schemes.filter(r =>
-                  r.schemeName.toLowerCase().includes(globalFilter.toLowerCase()) ||
-                  String(r.schemeCode).includes(globalFilter)
-                )
-              : g.schemes,
-          }))
-          .filter(g => g.schemes.length > 0)
-
-        const totalSchemes = filteredGroups.reduce((s, g) => s + g.schemes.length, 0)
-        const allHouses = browseResults.map(g => g.house)
-
-        return (
-          <div className={styles.section}>
-            <SectionHeader label={`${filteredGroups.length} fund houses · ${totalSchemes} schemes`} />
-
-            {/* Global filters */}
-            <div className={styles.filterBar} style={{ flexDirection: 'column', gap: 8 }}>
-              <input
-                className={styles.input}
-                placeholder="Search all schemes across all fund houses..."
-                value={globalFilter}
-                onChange={e => setGlobalFilter(e.target.value)}
-              />
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-                <span className={styles.label} style={{ marginRight: 4 }}>Fund Houses:</span>
-                <button
-                  className={`${styles.addToHistoryBtn} ${!selectedHouses ? styles.addedBadge : ''}`}
-                  onClick={() => setSelectedHouses(null)}
-                  style={!selectedHouses ? { background: 'var(--accent)', color: '#fff', borderColor: 'var(--accent)' } : {}}
-                >
-                  All ({allHouses.length})
-                </button>
-                {allHouses.map(h => {
-                  const active = selectedHouses?.has(h)
-                  return (
-                    <button
-                      key={h}
-                      className={styles.addToHistoryBtn}
-                      style={active ? { background: 'var(--accent)', color: '#fff', borderColor: 'var(--accent)' } : {}}
-                      onClick={() => {
-                        setSelectedHouses(prev => {
-                          const next = new Set(prev || allHouses)
-                          if (next.has(h)) next.delete(h)
-                          else next.add(h)
-                          return next.size === allHouses.length ? null : next.size === 0 ? new Set([h]) : next
-                        })
-                      }}
-                    >
-                      {h.split(' ')[0]}
-                    </button>
+          {/* Search results */}
+          {searchResults !== null && (
+            <div className={styles.section}>
+              <div className={styles.filterBar}>
+                <Field label="Filter Code">
+                  <input className={styles.input} placeholder="e.g. 125" value={codeFilter} onChange={e => setCodeFilter(e.target.value)} />
+                </Field>
+                <Field label="Filter Name">
+                  <input className={styles.input} placeholder="e.g. Direct Growth" value={nameFilter} onChange={e => setNameFilter(e.target.value)} />
+                </Field>
+              </div>
+              <SectionHeader
+                label={`${filteredResults.length} results`}
+                action={
+                  filteredResults.length > 0 && (
+                    <div className={styles.actions}>
+                      <Btn small onClick={() => downloadSearchResultsExcel(filteredResults)}>⬇ Excel</Btn>
+                      <SendToExcel name="Search Results" data={filteredResults.map(r => ({ 'Scheme Code': r.schemeCode, 'Scheme Name': r.schemeName }))} />
+                    </div>
                   )
-                })}
+                }
+              />
+              <div className={styles.resultList}>
+                {filteredResults.length === 0
+                  ? <Empty msg="No schemes match" />
+                  : filteredResults.slice(0, 200).map(r => <ResultRow key={r.schemeCode} r={r} />)
+                }
+                {filteredResults.length > 200 && (
+                  <div className={styles.empty}>Showing 200 of {filteredResults.length} — narrow your search</div>
+                )}
               </div>
             </div>
+          )}
 
-            {filteredGroups.length === 0 && <Empty msg="No schemes match filters" />}
-            <div className={styles.accordionStack}>
-              {filteredGroups.map(group => (
-                <FilterableGroup key={group.house} group={group} ResultRow={ResultRow} />
-              ))}
+          {/* Category browse filters */}
+          {amfiFilters && (
+            <div className={styles.section}>
+              <SectionHeader label="Browse by Category" />
+              <div className={styles.filterBar} style={{ flexDirection: 'column', gap: 8 }}>
+                <div style={{ display: 'flex', gap: 8, width: '100%' }}>
+                  <Field label="Category">
+                    <SearchSelect options={[{ id: 0, name: 'Select...' }, ...amfiFilters.investmentTypeList]} value={category} onChange={setCategory} placeholder="Category..." />
+                  </Field>
+                  <Field label="Sub Category">
+                    <SearchSelect options={[{ id: 0, name: 'All' }, ...subcategories]} value={subCategory} onChange={setSubCategory} placeholder="Sub category..." />
+                  </Field>
+                </div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', width: '100%' }}>
+                  <Field label="Fund House">
+                    <SearchSelect options={[{ id: 0, name: 'All Fund Houses' }, ...amfiFilters.mutualFundList]} value={fundHouse} onChange={setFundHouse} placeholder="Fund house..." />
+                  </Field>
+                  <Btn small onClick={runBrowse}>Browse</Btn>
+                </div>
+              </div>
             </div>
-          </div>
-        )
-      })()}
+          )}
+
+          {/* Browse results — grouped by fund house */}
+          {browseResults && (() => {
+            const filteredGroups = browseResults
+              .filter(g => !selectedHouses || selectedHouses.has(g.house))
+              .map(g => ({
+                ...g,
+                schemes: globalFilter
+                  ? g.schemes.filter(r =>
+                      r.schemeName.toLowerCase().includes(globalFilter.toLowerCase()) ||
+                      String(r.schemeCode).includes(globalFilter)
+                    )
+                  : g.schemes,
+              }))
+              .filter(g => g.schemes.length > 0)
+
+            const totalSchemes = filteredGroups.reduce((s, g) => s + g.schemes.length, 0)
+            const allHouses = browseResults.map(g => g.house)
+
+            return (
+              <div className={styles.section}>
+                <SectionHeader label={`${filteredGroups.length} fund houses · ${totalSchemes} schemes`} />
+                <div className={styles.filterBar} style={{ flexDirection: 'column', gap: 8 }}>
+                  <input
+                    className={styles.input}
+                    placeholder="Search all schemes across all fund houses..."
+                    value={globalFilter}
+                    onChange={e => setGlobalFilter(e.target.value)}
+                  />
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <span className={styles.label} style={{ marginRight: 4 }}>Fund Houses:</span>
+                    <button
+                      className={styles.addToHistoryBtn}
+                      onClick={() => setSelectedHouses(null)}
+                      style={!selectedHouses ? { background: 'var(--accent)', color: '#fff', borderColor: 'var(--accent)' } : {}}
+                    >
+                      All ({allHouses.length})
+                    </button>
+                    {allHouses.map(h => {
+                      const active = selectedHouses?.has(h)
+                      return (
+                        <button
+                          key={h}
+                          className={styles.addToHistoryBtn}
+                          style={active ? { background: 'var(--accent)', color: '#fff', borderColor: 'var(--accent)' } : {}}
+                          onClick={() => {
+                            setSelectedHouses(prev => {
+                              const next = new Set(prev || allHouses)
+                              if (next.has(h)) next.delete(h)
+                              else next.add(h)
+                              return next.size === allHouses.length ? null : next.size === 0 ? new Set([h]) : next
+                            })
+                          }}
+                        >
+                          {h.split(' ')[0]}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+                {filteredGroups.length === 0 && <Empty msg="No schemes match filters" />}
+                <div className={styles.accordionStack}>
+                  {filteredGroups.map(group => (
+                    <FilterableGroup key={group.house} group={group} ResultRow={ResultRow} />
+                  ))}
+                </div>
+              </div>
+            )
+          })()}
+        </>
+      )}
     </Panel>
   )
 }
