@@ -5,6 +5,7 @@ import { Panel, SectionHeader, Field, Btn, ErrorBox, Accordion, SkeletonCard, Sk
 import SendToExcel from '../components/SendToExcel'
 import { webExcelStore } from '../webExcelStore'
 import * as XLSX from 'xlsx'
+import JSZip from 'jszip'
 import NavResult from '../components/NavResult'
 import styles from '../App.module.css'
 
@@ -409,16 +410,24 @@ function HistoryPanel(_, ref) {
                   {isAnyFiltered && (
                     <Btn onClick={handleBulkDownload}>⬇ Filtered ZIP</Btn>
                   )}
-                  <Btn onClick={() => {
-                    const { trimmedWithAth } = buildPivotData(results, filteredSubsets)
-                    const ws = XLSX.utils.aoa_to_sheet(trimmedWithAth)
-                    const csv = XLSX.utils.sheet_to_csv(ws)
-                    const blob = new Blob([csv], { type: 'text/csv' })
+                  <Btn onClick={async () => {
+                    const { header, fullRows, trimmedWithAth, rolling3yr, rolling5yr, betaSheet } = buildPivotData(results, filteredSubsets)
+                    const zip = new JSZip()
+                    const addCsv = (name, rows) => {
+                      const ws = XLSX.utils.aoa_to_sheet(rows)
+                      zip.file(name, XLSX.utils.sheet_to_csv(ws))
+                    }
+                    addCsv('bulk_full.csv', [header, ...fullRows])
+                    addCsv('bulk_trimmed_ath.csv', trimmedWithAth)
+                    addCsv('3yr_rolling_return.csv', rolling3yr)
+                    addCsv('5yr_rolling_return.csv', rolling5yr)
+                    addCsv('beta_std_dev.csv', betaSheet)
+                    const blob = await zip.generateAsync({ type: 'blob' })
                     const url = URL.createObjectURL(blob)
                     const a = document.createElement('a')
-                    a.href = url; a.download = 'bulk_trimmed.csv'; a.click()
+                    a.href = url; a.download = 'bulk_analysis.zip'; a.click()
                     setTimeout(() => URL.revokeObjectURL(url), 1000)
-                  }}>⬇ Trimmed CSV</Btn>
+                  }}>⬇ Analysis ZIP</Btn>
                   <Btn onClick={() => {
                     const { header, fullRows, trimmedWithAth, rolling3yr, rolling5yr, betaSheet } = buildPivotData(results, filteredSubsets)
                     webExcelStore.addSheet('Bulk (Full)', [header, ...fullRows], [])
