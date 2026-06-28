@@ -181,7 +181,9 @@ export default function SearchPanel({ onSchemeSelect, onAddToHistory, onRemoveFr
                 action={
                   filteredResults.length > 0 && (
                     <div className={styles.actions}>
-                      <Btn small onClick={() => downloadSearchResultsExcel(filteredResults)}>⬇ Excel</Btn>
+                      <Btn small variant="secondary"
+                        title="Spreadsheet of scheme codes + names only (no NAV data). Click a scheme, then use NAV History / Latest NAV for full analytics."
+                        onClick={() => downloadSearchResultsExcel(filteredResults)}>⬇ Scheme list</Btn>
                       <SendToExcel name="Search Results" data={filteredResults.map(r => ({ 'Scheme Code': r.schemeCode, 'Scheme Name': r.schemeName }))} />
                     </div>
                   )

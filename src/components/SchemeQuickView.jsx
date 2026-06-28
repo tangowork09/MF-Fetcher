@@ -9,6 +9,7 @@ export default function SchemeQuickView({ code, name }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -25,12 +26,13 @@ export default function SchemeQuickView({ code, name }) {
   }, [code])
 
   const handleFullHistory = async () => {
+    setBusy(true)
     try {
       const full = await api.history(code)
-      if (full.status === 'SUCCESS') downloadExcel(full.data, full.meta, `${full.meta.scheme_code} - ${full.meta.scheme_name} - all.xlsx`)
+      if (full.status === 'SUCCESS') await downloadExcel(full.data, full.meta, `${full.meta.scheme_code} - ${full.meta.scheme_name} - full.xlsx`)
     } catch {
       setError('Failed to download full history')
-    }
+    } finally { setBusy(false) }
   }
 
   const meta = data?.meta
@@ -60,15 +62,17 @@ export default function SchemeQuickView({ code, name }) {
             {meta.isin_growth && <div className={styles.qvCell}><div className={styles.qvKey}>ISIN</div><div className={`${styles.qvVal} ${styles.qvIsin}`}>{meta.isin_growth}</div></div>}
           </div>
           <div className={styles.actions}>
-            <Btn small onClick={() => downloadExcel(data.data, meta, `${meta.scheme_code} - ${meta.scheme_name} - latest.xlsx`)}>
-              ⬇ Excel
+            <Btn small variant="secondary" title="Single-row workbook: just the latest NAV + scheme info"
+              onClick={() => downloadExcel(data.data, meta, `${meta.scheme_code} - ${meta.scheme_name} - latest.xlsx`)}>
+              ⬇ Latest only
             </Btn>
-            <Btn small onClick={handleFullHistory}>
-              ⬇ Full History
+            <Btn small loading={busy} title="Full NAV history workbook: Summary, NAV History (real dates) and Risk & Return Metrics (live formulas)"
+              onClick={handleFullHistory}>
+              ⬇ Full history + metrics
             </Btn>
             <SendToExcel
               name={`${meta.scheme_code} Latest`}
-              data={[{ Code: meta.scheme_code, Name: meta.scheme_name, NAV: nav.nav, Date: nav.date, 'Fund House': meta.fund_house, Category: meta.scheme_category }]}
+              data={[{ Code: meta.scheme_code, Name: meta.scheme_name, NAV: parseFloat(nav.nav), Date: nav.date, 'Fund House': meta.fund_house, Category: meta.scheme_category }]}
             />
           </div>
         </>

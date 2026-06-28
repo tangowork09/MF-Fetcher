@@ -52,15 +52,17 @@ export function Field({ label, children }) {
   )
 }
 
-export function Btn({ children, onClick, type = 'button', loading, disabled, small }) {
+export function Btn({ children, onClick, type = 'button', loading, disabled, small, variant = 'primary', title }) {
+  const variantClass = variant === 'secondary' ? styles.btnSecondary : variant === 'ghost' ? styles.btnGhost : ''
   return (
     <button
       type={type}
-      className={`${styles.btn} ${small ? styles.btnSmall : ''}`}
+      className={`${styles.btn} ${variantClass} ${small ? styles.btnSmall : ''}`}
       onClick={onClick}
       disabled={disabled || loading}
+      title={title}
     >
-      {loading ? <><Spinner inline /> <span>Loading…</span></> : children}
+      {loading ? <><Spinner inline /> <span>Working…</span></> : children}
     </button>
   )
 }

@@ -1,308 +1,116 @@
-import { useState, useCallback, useImperativeHandle, forwardRef } from 'react'
+import { useState, useCallback, useRef, useImperativeHandle, forwardRef } from 'react'
 import { api } from '../api'
-import { downloadBulkZip } from '../excel'
+import { downloadExcel, downloadBulkZip, downloadAnalysisXlsx, analysisSheetsForWebExcel } from '../excel'
 import { Panel, SectionHeader, Field, Btn, ErrorBox, Accordion, SkeletonCard, Skeleton } from '../components/ui'
-import SendToExcel from '../components/SendToExcel'
 import { webExcelStore } from '../webExcelStore'
-import * as XLSX from 'xlsx'
-import JSZip from 'jszip'
 import NavResult from '../components/NavResult'
 import styles from '../App.module.css'
 
-function parseDDMMYYYY(s) {
-  const [d, m, y] = s.split('-')
-  return new Date(`${y}-${m}-${d}`)
-}
+// Real benchmark indices via api.mfapi.in index-fund NAVs (SEBI-TRI proxies).
+const BENCHMARKS = [
+  { label: 'None', code: '' },
+  { label: 'Nifty 50 (UTI Index Fund)', code: '100822' },
+  { label: 'Nifty Next 50', code: '149837' },
+  { label: 'Nifty 500', code: '147625' },
+  { label: 'BSE Sensex', code: '113269' },
+  { label: 'Custom scheme code…', code: 'custom' },
+]
 
-function buildPivotData(results, filteredSubsets) {
-  const dateMap = new Map()
-  const schemeCols = []
-
-  results.forEach(r => {
-    const d = filteredSubsets[r.meta.scheme_code] || r.data
-    const colName = `${r.meta.scheme_code} - ${r.meta.scheme_name}`
-    schemeCols.push(colName)
-    d.forEach(row => {
-      if (!dateMap.has(row.date)) dateMap.set(row.date, {})
-      dateMap.get(row.date)[colName] = row.nav
-    })
-  })
-
-  const sortedDates = [...dateMap.keys()].sort((a, b) => parseDDMMYYYY(a) - parseDDMMYYYY(b))
-  const header = ['Date', ...schemeCols]
-
-  const fullRows = sortedDates.map(date => {
-    const entry = dateMap.get(date)
-    return [date, ...schemeCols.map(col => entry[col] ?? '')]
-  })
-
-  // Trimmed: find the latest start date across ALL schemes (where all have data)
-  // then remove all rows before that date
-  const startDates = results.map(r => {
-    const d = filteredSubsets[r.meta.scheme_code] || r.data
-    if (d.length === 0) return null
-    // Data might be desc or asc — find the earliest date
-    const dates = d.map(row => parseDDMMYYYY(row.date))
-    return new Date(Math.min(...dates))
-  }).filter(Boolean)
-
-  const latestStart = startDates.length > 0 ? new Date(Math.max(...startDates)) : null
-
-  const trimmedRows = latestStart
-    ? fullRows.filter(row => parseDDMMYYYY(row[0]) >= latestStart)
-    : fullRows
-
-  // All Time High for each scheme (from FULL data, not trimmed)
-  const athValues = schemeCols.map(col => {
-    let max = -Infinity
-    fullRows.forEach(row => {
-      const idx = schemeCols.indexOf(col) + 1
-      const val = parseFloat(row[idx])
-      if (!isNaN(val) && val > max) max = val
-    })
-    return max === -Infinity ? '' : max
-  })
-  const athRow = ['ALL TIME HIGH', ...athValues]
-
-  // Last date values (last row of full data = most recent date)
-  const lastRow = fullRows.length > 0 ? fullRows[fullRows.length - 1] : null
-  const lastDateRow = lastRow
-    ? [lastRow[0], ...schemeCols.map((_, i) => lastRow[i + 1])]
-    : ['LATEST', ...schemeCols.map(() => '')]
-
-  // % from ATH: ((ATH - latest) / ATH) * 100 = how far below ATH
-  const pctFromAth = ['% BELOW ATH', ...schemeCols.map((_, i) => {
-    const ath = parseFloat(athValues[i])
-    const latest = parseFloat(lastDateRow[i + 1])
-    if (isNaN(ath) || isNaN(latest) || ath === 0) return ''
-    const pct = ((ath - latest) / ath) * 100
-    return pct.toFixed(2) + '%'
-  })]
-
-  // Trimmed with ATH header: ATH, latest, % below, blank, header, data
-  const trimmedWithAth = [athRow, lastDateRow, pctFromAth, Array(header.length).fill(''), header, ...trimmedRows]
-
-  // Build NAV lookup for rolling calcs
-  const dateNavMap = {}
-  schemeCols.forEach((col, ci) => {
-    dateNavMap[col] = {}
-    trimmedRows.forEach(row => {
-      const nav = parseFloat(row[ci + 1])
-      if (!isNaN(nav)) {
-        dateNavMap[col][parseDDMMYYYY(row[0]).getTime()] = nav
-      }
-    })
-  })
-
-  function buildRollingSheet(years) {
-    const rows = []
-    const now = new Date()
-    now.setHours(0, 0, 0, 0)
-    const cutoff = new Date(now)
-    cutoff.setFullYear(cutoff.getFullYear() - years)
-
-    trimmedRows.forEach(row => {
-      const startDate = parseDDMMYYYY(row[0])
-      if (startDate > cutoff) return
-      const endDate = new Date(startDate)
-      endDate.setFullYear(endDate.getFullYear() + years)
-      const targetMs = endDate.getTime()
-
-      const returns = schemeCols.map(col => {
-        const startNav = dateNavMap[col][startDate.getTime()]
-        if (startNav == null || startNav === 0) return ''
-        let endNav = null
-        for (let offset = 0; offset <= 7; offset++) {
-          if (dateNavMap[col][targetMs + offset * 86400000] != null) { endNav = dateNavMap[col][targetMs + offset * 86400000]; break }
-          if (dateNavMap[col][targetMs - offset * 86400000] != null) { endNav = dateNavMap[col][targetMs - offset * 86400000]; break }
-        }
-        if (endNav == null) return ''
-        const cagr = (Math.pow(endNav / startNav, 1 / years) - 1) * 100
-        return cagr.toFixed(2) + '%'
-      })
-      if (returns.some(v => v !== '')) rows.push([row[0], ...returns])
-    })
-
-    const stats = schemeCols.map((_, ci) => {
-      const vals = rows.map(r => parseFloat(r[ci + 1])).filter(v => !isNaN(v)).sort((a, b) => a - b)
-      if (vals.length === 0) return { median: '', avg: '' }
-      const mid = Math.floor(vals.length / 2)
-      const median = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2
-      const avg = vals.reduce((s, v) => s + v, 0) / vals.length
-      return { median: median.toFixed(2) + '%', avg: avg.toFixed(2) + '%' }
-    })
-
-    const hdr = ['Date', ...schemeCols]
-    return [
-      ['MEDIAN', ...stats.map(s => s.median)],
-      ['AVERAGE', ...stats.map(s => s.avg)],
-      Array(hdr.length).fill(''),
-      hdr,
-      ...rows,
-    ]
-  }
-
-  const rolling3yr = buildRollingSheet(3)
-  const rolling5yr = buildRollingSheet(5)
-
-  // Beta & Std Deviation sheet
-  // 1. Build monthly NAV table (first available date each month)
-  const monthlyNavs = [] // [{ date, navs: [nav1, nav2, ...] }]
-  const seen = new Set()
-  trimmedRows.forEach(row => {
-    const d = parseDDMMYYYY(row[0])
-    const key = `${d.getFullYear()}-${d.getMonth()}`
-    if (seen.has(key)) return
-    seen.add(key)
-    const navs = schemeCols.map((_, ci) => parseFloat(row[ci + 1]))
-    monthlyNavs.push({ date: row[0], navs })
-  })
-
-  // 2. Monthly returns: ((current / previous) - 1) * 100
-  const monthlyReturns = monthlyNavs.map((m, i) => {
-    if (i === 0) return { date: m.date, returns: schemeCols.map(() => '') }
-    const prev = monthlyNavs[i - 1]
-    const returns = m.navs.map((nav, ci) => {
-      const prevNav = prev.navs[ci]
-      if (isNaN(nav) || isNaN(prevNav) || prevNav === 0) return ''
-      return ((nav / prevNav - 1) * 100).toFixed(4)
-    })
-    return { date: m.date, returns }
-  })
-
-  // 3. Std Dev for each scheme
-  const schemeReturnArrays = schemeCols.map((_, ci) =>
-    monthlyReturns.map(r => parseFloat(r.returns[ci])).filter(v => !isNaN(v))
+function AnalyticsOptions({ rfr, setRfr, benchSel, setBenchSel, customCode, setCustomCode }) {
+  return (
+    <details className={styles.opt}>
+      <summary className={styles.optSummary}>
+        Analytics settings
+        <span className={styles.optHint}>
+          risk-free {rfr || '5.25'}%{benchSel ? ` · vs ${BENCHMARKS.find(b => b.code === benchSel)?.label || benchSel}` : ''}
+        </span>
+      </summary>
+      <div className={styles.optBody}>
+        <div className={styles.optRow}>
+          <Field label="Risk-free rate (annual %)">
+            <input className={styles.input} type="number" step="0.05" min="0" value={rfr}
+              onChange={e => setRfr(e.target.value)} placeholder="5.25" />
+          </Field>
+          <Field label="Benchmark (for beta / alpha)">
+            <select className={styles.input} value={benchSel} onChange={e => setBenchSel(e.target.value)}>
+              {BENCHMARKS.map(b => <option key={b.code || 'none'} value={b.code}>{b.label}</option>)}
+            </select>
+          </Field>
+          {benchSel === 'custom' && (
+            <Field label="Benchmark scheme code">
+              <input className={styles.input} value={customCode} onChange={e => setCustomCode(e.target.value)} placeholder="e.g. 120716" />
+            </Field>
+          )}
+        </div>
+        <p className={styles.optNote}>
+          Risk-free rate drives Sharpe / Sortino / Treynor (default 5.25% ≈ RBI repo, Jun 2026). The benchmark is a real
+          index-fund NAV (Total-Return proxy) fetched from the same API — it adds beta, alpha, R², tracking error and
+          capture ratios. Std dev is the sample (n-1) daily std dev annualized ×√252.
+        </p>
+      </div>
+    </details>
   )
-
-  function stddev(arr) {
-    if (arr.length < 2) return 0
-    const mean = arr.reduce((s, v) => s + v, 0) / arr.length
-    const variance = arr.reduce((s, v) => s + (v - mean) ** 2, 0) / (arr.length - 1)
-    return Math.sqrt(variance)
-  }
-
-  function correlation(a, b) {
-    if (a.length !== b.length || a.length < 2) return 0
-    const meanA = a.reduce((s, v) => s + v, 0) / a.length
-    const meanB = b.reduce((s, v) => s + v, 0) / b.length
-    let num = 0, denA = 0, denB = 0
-    for (let i = 0; i < a.length; i++) {
-      const da = a[i] - meanA, db = b[i] - meanB
-      num += da * db
-      denA += da * da
-      denB += db * db
-    }
-    const den = Math.sqrt(denA * denB)
-    return den === 0 ? 0 : num / den
-  }
-
-  // 4. Market = equal-weighted average of all schemes' monthly returns
-  const marketReturns = []
-  for (let i = 0; i < monthlyReturns.length; i++) {
-    const vals = schemeReturnArrays.map(arr => arr[i]).filter(v => v !== undefined && !isNaN(v))
-    marketReturns.push(vals.length > 0 ? vals.reduce((s, v) => s + v, 0) / vals.length : 0)
-  }
-  // Align lengths — market starts from index where returns exist
-  const validMarket = marketReturns.filter((_, i) => i > 0).slice(0)
-  const marketStdDev = stddev(validMarket)
-
-  const schemeStats = schemeCols.map((_, ci) => {
-    const returns = schemeReturnArrays[ci]
-    const sd = stddev(returns)
-    // Align scheme returns with market for correlation
-    const aligned = []
-    const alignedMarket = []
-    let mIdx = 0
-    monthlyReturns.forEach((r, i) => {
-      if (i === 0) return
-      const val = parseFloat(r.returns[ci])
-      if (!isNaN(val)) {
-        aligned.push(val)
-        alignedMarket.push(validMarket[mIdx] ?? 0)
-      }
-      mIdx++
-    })
-    const corr = correlation(aligned, alignedMarket)
-    const beta = marketStdDev > 0 ? corr * (sd / marketStdDev) : 0
-    return { sd: sd.toFixed(4), corr: corr.toFixed(4), beta: beta.toFixed(4) }
-  })
-
-  // 5. Build the sheet: stats rows, blank, two side-by-side tables
-  const betaHeader = ['', ...schemeCols]
-  const corrRow = ['CORRELATION', ...schemeStats.map(s => s.corr)]
-  const betaRow = ['BETA', ...schemeStats.map(s => s.beta)]
-  const sdRow = ['STD DEVIATION', ...schemeStats.map(s => s.sd)]
-  const blank = Array(betaHeader.length).fill('')
-
-  // Monthly NAV table + Monthly Return table side by side
-  const navHeader = ['Date (NAV)', ...schemeCols]
-  const retHeader = ['Date (Return %)', ...schemeCols]
-  const combinedHeader = [...navHeader, '', ...retHeader]
-  const maxRows = monthlyNavs.length
-  const betaSheetRows = [
-    ['CORRELATION', ...schemeStats.map(s => s.corr), '', 'CORRELATION', ...schemeStats.map(s => s.corr)],
-    ['BETA', ...schemeStats.map(s => s.beta), '', 'BETA', ...schemeStats.map(s => s.beta)],
-    ['STD DEVIATION', ...schemeStats.map(s => s.sd), '', 'STD DEVIATION', ...schemeStats.map(s => s.sd)],
-    Array(combinedHeader.length).fill(''),
-    combinedHeader,
-  ]
-
-  for (let i = 0; i < maxRows; i++) {
-    const nav = monthlyNavs[i]
-    const ret = monthlyReturns[i]
-    const navCells = [nav.date, ...nav.navs.map(v => isNaN(v) ? '' : v)]
-    const retCells = [ret.date, ...ret.returns]
-    betaSheetRows.push([...navCells, '', ...retCells])
-  }
-
-  const betaSheet = betaSheetRows
-
-  return { header, fullRows, trimmedRows, trimmedWithAth, athRow, rolling3yr, rolling5yr, betaSheet, latestStart }
 }
 
-/**
- * Single Responsibility: fetch and display NAV history for multiple schemes.
- * Open/Closed: new download formats can be added without modifying this component.
- */
 function HistoryPanel(_, ref) {
   const [rows, setRows] = useState([{ id: Date.now(), val: '', start: '', end: '' }])
   const [results, setResults] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [filteredSubsets, setFilteredSubsets] = useState({})
+  const [rfr, setRfr] = useState('5.25')
+  const [benchSel, setBenchSel] = useState('')
+  const [customCode, setCustomCode] = useState('')
+  const [bulkScope, setBulkScope] = useState('all') // 'all' | 'filter'
+  const [busy, setBusy] = useState(false)
+  const benchCache = useRef({})
 
   const handleFilteredDataChange = useCallback((code, filteredData) => {
     setFilteredSubsets(prev => ({ ...prev, [code]: filteredData }))
   }, [])
 
-  const handleBulkDownload = () => {
-    const exportResults = results.map(r => {
-      const code = r.meta.scheme_code
-      return { ...r, data: filteredSubsets[code] || r.data }
-    })
-    downloadBulkZip(exportResults)
-  }
+  const resolveOpts = useCallback(async (withFilter) => {
+    const opts = { rfr: (parseFloat(rfr) || 5.25) / 100 }
+    if (withFilter) opts.filteredSubsets = filteredSubsets
+    const code = (benchSel === 'custom' ? customCode : benchSel).trim()
+    if (code) {
+      if (!benchCache.current[code]) benchCache.current[code] = await api.history(code).catch(() => null)
+      const b = benchCache.current[code]
+      if (b && b.status === 'SUCCESS') { opts.benchSeries = b.data; opts.benchMeta = b.meta }
+    }
+    return opts
+  }, [rfr, benchSel, customCode, filteredSubsets])
 
-  const updateRow = (id, field, value) => {
-    setRows(rows.map(r => r.id === id ? { ...r, [field]: value } : r))
-  }
-  const clearDates = (id) => {
-    setRows(rows.map(r => r.id === id ? { ...r, start: '', end: '' } : r))
-  }
-  const addRow = () => {
-    setRows(prev => [...prev, { id: Date.now(), val: '', start: '', end: '' }])
-  }
+  const run = useCallback(async (fn) => {
+    setBusy(true)
+    try { await fn() } catch (e) { setError('Export failed: ' + (e?.message || 'unknown error')) } finally { setBusy(false) }
+  }, [])
+
+  const scopedResults = () => bulkScope === 'filter'
+    ? results.map(r => ({ ...r, data: filteredSubsets[r.meta.scheme_code] || r.data }))
+    : results
+
+  const downloadOne = useCallback(async (data, meta, filename) => {
+    await run(async () => downloadExcel(data, meta, filename, await resolveOpts(false)))
+  }, [run, resolveOpts])
+
+  const handleBulkZip = () => run(async () => downloadBulkZip(scopedResults(), await resolveOpts(true)))
+  const handleComparison = () => run(async () => downloadAnalysisXlsx(scopedResults(), bulkScope === 'filter' ? {} : filteredSubsets, await resolveOpts(false)))
+  const handleWebExcel = () => run(async () => {
+    const sheets = analysisSheetsForWebExcel(scopedResults(), bulkScope === 'filter' ? {} : filteredSubsets, await resolveOpts(false))
+    sheets.forEach(s => webExcelStore.addSheet(s.name, s.rows, []))
+  })
+
+  const updateRow = (id, field, value) => setRows(rows.map(r => r.id === id ? { ...r, [field]: value } : r))
+  const clearDates = (id) => setRows(rows.map(r => r.id === id ? { ...r, start: '', end: '' } : r))
+  const addRow = () => setRows(prev => [...prev, { id: Date.now(), val: '', start: '', end: '' }])
   const addSchemeCode = useCallback((code) => {
     setRows(prev => {
       const empty = prev.find(r => !r.val.trim())
-      if (empty) {
-        return prev.map(r => r.id === empty.id ? { ...r, val: String(code) } : r)
-      }
+      if (empty) return prev.map(r => r.id === empty.id ? { ...r, val: String(code) } : r)
       return [...prev, { id: Date.now(), val: String(code), start: '', end: '' }]
     })
   }, [])
-
   const removeSchemeCode = useCallback((code) => {
     const str = String(code)
     setRows(prev => {
@@ -310,58 +118,45 @@ function HistoryPanel(_, ref) {
       return filtered.length > 0 ? filtered : [{ id: Date.now(), val: '', start: '', end: '' }]
     })
   }, [])
-
   useImperativeHandle(ref, () => ({ addSchemeCode, removeSchemeCode }), [addSchemeCode, removeSchemeCode])
-
-  const removeRow = (id) => {
-    if (rows.length > 1) setRows(rows.filter(r => r.id !== id))
-  }
+  const removeRow = (id) => { if (rows.length > 1) setRows(rows.filter(r => r.id !== id)) }
 
   const fetch_ = async (e) => {
     e?.preventDefault()
     const validRows = rows.filter(r => r.val.trim())
     if (validRows.length === 0) return
-
     setLoading(true); setError(null); setResults(null)
     try {
-      const promises = validRows.map(r =>
+      const responses = await Promise.all(validRows.map(r =>
         api.history(r.val.trim(), r.start || undefined, r.end || undefined).then(res => {
-          res.reqStart = r.start
-          res.reqEnd = r.end
-          return res
+          res.reqStart = r.start; res.reqEnd = r.end; return res
         })
-      )
-      const responses = await Promise.all(promises)
-
+      ))
       const validResults = responses.filter(res => res.status === 'SUCCESS')
-      if (validResults.length === 0) {
-        setError('No schemes found or valid data returned.')
-      } else {
+      if (validResults.length === 0) setError('No NAV data for those codes. Check the scheme codes and try again.')
+      else {
         setResults(validResults)
-        if (validResults.length < validRows.length) {
-          setError(`Warning: Some schemes were not found (${validRows.length - validResults.length} failed).`)
-        }
+        if (validResults.length < validRows.length) setError(`${validRows.length - validResults.length} of ${validRows.length} codes returned no data and were skipped.`)
       }
     } catch {
-      setError('Failed to fetch. Check your connection.')
+      setError('Couldn’t reach the fund API. Check your connection and try again.')
     } finally { setLoading(false) }
   }
 
+  const anyFiltered = results && results.some(r => {
+    const code = r.meta.scheme_code
+    return filteredSubsets[code] && filteredSubsets[code].length !== r.data.length
+  })
+
   return (
-    <Panel title="NAV History" subtitle="Full NAV history for one or multiple schemes">
+    <Panel title="NAV History" subtitle="Full NAV history + risk &amp; return analytics for one or many schemes">
       <form className={styles.form} onSubmit={fetch_}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           {rows.map((r, i) => (
             <div key={r.id} className={styles.schemeRow}>
-              <Field label="Scheme Code *">
-                <input
-                  className={styles.input}
-                  value={r.val}
-                  onChange={e => updateRow(r.id, 'val', e.target.value)}
-                  placeholder="e.g. 125497"
-                  required={i === 0}
-                  style={{ minWidth: '140px' }}
-                />
+              <Field label={i === 0 ? 'Scheme Code *' : 'Scheme Code'}>
+                <input className={styles.input} value={r.val} onChange={e => updateRow(r.id, 'val', e.target.value)}
+                  placeholder="e.g. 125497" required={i === 0} style={{ minWidth: '140px' }} />
               </Field>
               <Field label="Start Date">
                 <input type="date" className={styles.input} value={r.start} onChange={e => updateRow(r.id, 'start', e.target.value)} />
@@ -370,18 +165,14 @@ function HistoryPanel(_, ref) {
                 <input type="date" className={styles.input} value={r.end} onChange={e => updateRow(r.id, 'end', e.target.value)} />
               </Field>
               <div style={{ display: 'flex', gap: '8px', alignSelf: 'flex-end', paddingBottom: '2px' }}>
-                {(r.start || r.end) && (
-                  <Btn type="button" onClick={() => clearDates(r.id)} small>Clear Dates</Btn>
-                )}
-                {rows.length > 1 && (
-                  <Btn type="button" onClick={() => removeRow(r.id)} small>✕</Btn>
-                )}
+                {(r.start || r.end) && <Btn type="button" variant="ghost" onClick={() => clearDates(r.id)} small>Clear Dates</Btn>}
+                {rows.length > 1 && <Btn type="button" variant="ghost" onClick={() => removeRow(r.id)} small title="Remove this scheme">✕</Btn>}
               </div>
             </div>
           ))}
         </div>
         <div style={{ display: 'flex', gap: '12px', marginTop: '4px' }}>
-          <Btn type="button" onClick={addRow} small>+ Add Scheme</Btn>
+          <Btn type="button" variant="secondary" onClick={addRow} small>+ Add Scheme</Btn>
           <Btn type="submit" loading={loading}>Fetch History</Btn>
         </div>
       </form>
@@ -395,65 +186,64 @@ function HistoryPanel(_, ref) {
         </div>
       )}
 
-      {!loading && results && results.length > 0 && (() => {
-        const isAnyFiltered = results.some(r => {
-          const code = r.meta.scheme_code
-          return filteredSubsets[code] && filteredSubsets[code].length !== r.data.length
-        })
-        return (
-          <div className={styles.section}>
-            <SectionHeader
-              label={`${results.length} Schemes Loaded`}
-              action={
-                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                  <Btn onClick={() => downloadBulkZip(results)}>⬇ Bulk ZIP</Btn>
-                  {isAnyFiltered && (
-                    <Btn onClick={handleBulkDownload}>⬇ Filtered ZIP</Btn>
-                  )}
-                  <Btn onClick={() => {
-                    const { header, fullRows, trimmedWithAth, rolling3yr, rolling5yr, betaSheet } = buildPivotData(results, filteredSubsets)
-                    const wb = XLSX.utils.book_new()
-                    const addSheet = (name, rows) => {
-                      const ws = XLSX.utils.aoa_to_sheet(rows)
-                      XLSX.utils.book_append_sheet(wb, ws, name.slice(0, 31))
-                    }
-                    addSheet('Full', [header, ...fullRows])
-                    addSheet('Trimmed + ATH', trimmedWithAth)
-                    addSheet('3yr Rolling Return', rolling3yr)
-                    addSheet('5yr Rolling Return', rolling5yr)
-                    addSheet('Beta & Std Dev', betaSheet)
-                    XLSX.writeFile(wb, 'bulk_analysis.xlsx')
-                  }}>⬇ Analysis .xlsx</Btn>
-                  <Btn onClick={() => {
-                    const { header, fullRows, trimmedWithAth, rolling3yr, rolling5yr, betaSheet } = buildPivotData(results, filteredSubsets)
-                    webExcelStore.addSheet('Bulk (Full)', [header, ...fullRows], [])
-                    webExcelStore.addSheet('Bulk (Trimmed + ATH)', trimmedWithAth, [])
-                    webExcelStore.addSheet('3yr Rolling Return', rolling3yr, [])
-                    webExcelStore.addSheet('5yr Rolling Return', rolling5yr, [])
-                    webExcelStore.addSheet('Beta & Std Dev', betaSheet, [])
-                  }}>📊 To Excel</Btn>
+      {!loading && results && results.length > 0 && (
+        <div className={styles.section}>
+          <SectionHeader label={`${results.length} scheme${results.length === 1 ? '' : 's'} loaded`} />
+
+          <AnalyticsOptions
+            rfr={rfr} setRfr={setRfr}
+            benchSel={benchSel} setBenchSel={setBenchSel}
+            customCode={customCode} setCustomCode={setCustomCode}
+          />
+
+          {results.length > 1 && (
+            <div className={styles.exportBlock}>
+              <div className={styles.exportHead}>
+                <span className={styles.exportTitle}>Export {results.length} schemes</span>
+              </div>
+              <p className={styles.exportManifest}>
+                <b>Download all (ZIP)</b>: one analytics workbook per scheme + a comparison workbook.&nbsp;
+                <b>Comparison workbook</b>: every scheme side-by-side (Risk Comparison, ATH, 3Y/5Y rolling, full NAV) with real dates &amp; numbers.&nbsp;
+                <b>Open in Web Excel</b>: same comparison, editable in-app.
+              </p>
+              {anyFiltered && (
+                <div className={styles.segWrap}>
+                  <span className={styles.segLabel}>Date range to export</span>
+                  <div className={styles.seg}>
+                    <button type="button" className={`${styles.segBtn} ${bulkScope === 'all' ? styles.segActive : ''}`} onClick={() => setBulkScope('all')}>Full history</button>
+                    <button type="button" className={`${styles.segBtn} ${bulkScope === 'filter' ? styles.segActive : ''}`} onClick={() => setBulkScope('filter')}>Current filters</button>
+                  </div>
                 </div>
-              }
-            />
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-              {results.map((data) => (
-                <Accordion
-                  key={data.meta.scheme_code}
-                  title={`${data.meta.scheme_code} - ${data.meta.scheme_name}`}
-                  defaultOpen={results.length === 1}
-                >
-                  <NavResult
-                    data={data}
-                    startDate={data.reqStart}
-                    endDate={data.reqEnd}
-                    onFilteredDataChange={handleFilteredDataChange}
-                  />
-                </Accordion>
-              ))}
+              )}
+              <div className={styles.exportActions}>
+                <Btn onClick={handleBulkZip} loading={busy}>⬇ Download all (ZIP)</Btn>
+                <Btn variant="secondary" onClick={handleComparison} loading={busy}>⬇ Comparison workbook (.xlsx)</Btn>
+                <Btn variant="secondary" onClick={handleWebExcel} loading={busy}>📊 Open comparison in Web Excel</Btn>
+              </div>
             </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {results.map((data) => (
+              <Accordion
+                key={data.meta.scheme_code}
+                title={`${data.meta.scheme_code} - ${data.meta.scheme_name}`}
+                defaultOpen={results.length === 1}
+              >
+                <NavResult
+                  data={data}
+                  startDate={data.reqStart}
+                  endDate={data.reqEnd}
+                  onFilteredDataChange={handleFilteredDataChange}
+                  onDownload={downloadOne}
+                  busy={busy}
+                  hasBench={!!(benchSel === 'custom' ? customCode.trim() : benchSel)}
+                />
+              </Accordion>
+            ))}
           </div>
-        )
-      })()}
+        </div>
+      )}
     </Panel>
   )
 }

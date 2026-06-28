@@ -77,11 +77,13 @@ export default function BrowsePanel() {
             label={`${filteredSchemes.length} schemes${total ? ` of ${total}` : ''}`}
             action={
               <div className={styles.actions}>
-                <Btn small onClick={() => downloadSearchResultsExcel(filteredSchemes.map(s => ({
-                  schemeCode: s.schemeCode || s.Scheme_Code,
-                  schemeName: s.schemeName || s.Scheme_Name,
-                })))}>
-                  ⬇ Download {isFiltered ? 'Filtered ' : ''}Excel
+                <Btn small variant="secondary"
+                  title="Spreadsheet of scheme codes + names only (no NAV data). Open a scheme in NAV History or Latest NAV for full analytics."
+                  onClick={() => downloadSearchResultsExcel(filteredSchemes.map(s => ({
+                    schemeCode: s.schemeCode || s.Scheme_Code,
+                    schemeName: s.schemeName || s.Scheme_Name,
+                  })))}>
+                  ⬇ {isFiltered ? 'Filtered ' : ''}scheme list
                 </Btn>
                 <SendToExcel
                   name="Browse Schemes"
