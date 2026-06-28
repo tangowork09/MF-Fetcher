@@ -4,6 +4,7 @@ import {
   toSeries, toDisplaySeries, computeMetrics, computeBenchmarkMetrics,
   dailyReturns, rollingReturns, yearsBetween, percentileInc,
 } from './metrics.js'
+import { PARAMETERS, EXTRA_METRICS, REFERENCE_NOTE, COVERAGE } from './parameters.js'
 
 // exceljs is heavy — load it only when an export actually runs.
 async function loadExcelJS() {
@@ -149,19 +150,34 @@ function addMetricsSheet(wb, m, lastRow) {
   fRow('Mean daily return', `AVERAGE(${RET})`, rm.meanDaily, FMT.pct, 'Average daily simple return')
   fRow('Best day', `MAX(${RET})`, rm.bestDay, FMT.pct, 'Largest single-day gain')
   fRow('Worst day', `MIN(${RET})`, rm.worstDay, FMT.pct, 'Largest single-day loss')
+  if (rm.ytd) vRow('YTD return', rm.ytd.value, FMT.pct, `From ${rm.ytd.startDate} (prev year-end NAV)`)
   for (const [k, t] of Object.entries(rm.trailing)) {
     if (t) vRow(`Trailing ${k} return${t.annualized ? ' (p.a.)' : ''}`, t.value, FMT.pct, `From ${t.startDate}${t.annualized ? ' · CAGR' : ' · absolute'}`)
     else { const r = ws.addRow([`Trailing ${k} return`, '—', 'Insufficient history']) ; r.getCell(2).alignment = { horizontal: 'right' } }
   }
-  if (rm.rolling1Y) {
-    vRow('Rolling 1Y — average', rm.rolling1Y.average, FMT.pct, `${rm.rolling1Y.count} windows`)
-    ws.addRow(['Rolling 1Y — min / max', `${(rm.rolling1Y.min * 100).toFixed(2)}% / ${(rm.rolling1Y.max * 100).toFixed(2)}%`, 'Worst / best 1Y window'])
-    vRow('Rolling 1Y — % positive', rm.rolling1Y.pctPositive, FMT.pct, 'Share of positive 1Y windows')
+  for (const [k, r] of [['1Y', rm.rolling1Y], ['3Y', rm.rolling3Y], ['5Y', rm.rolling5Y]]) {
+    if (!r) continue
+    vRow(`Rolling ${k} — average${k === '1Y' ? '' : ' (p.a.)'}`, r.average, FMT.pct, `${r.count} windows`)
+    ws.addRow([`Rolling ${k} — min / max`, `${(r.min * 100).toFixed(2)}% / ${(r.max * 100).toFixed(2)}%`, `Worst / best ${k} window`])
+    vRow(`Rolling ${k} — % positive`, r.pctPositive, FMT.pct, `Share of positive ${k} windows`)
+  }
+
+  // SIP returns (XIRR) — actual systematic-investment return simulated on the NAV
+  const sip = rm.sip || {}
+  if (sip['1Y'] || sip['3Y'] || sip['5Y'] || sip['SI']) {
+    ws.addRow([])
+    section('SIP RETURNS (XIRR)')
+    for (const [k, label] of [['1Y', '1-year'], ['3Y', '3-year'], ['5Y', '5-year'], ['SI', 'Since inception']]) {
+      const s = sip[k]
+      if (s && isFinite(s.xirr)) vRow(`SIP ${label} (XIRR p.a.)`, s.xirr, FMT.pct, `${s.installments} monthly installments · invested ₹${Math.round(s.invested).toLocaleString('en-IN')} → ₹${Math.round(s.finalValue).toLocaleString('en-IN')}`)
+      else { const r = ws.addRow([`SIP ${label} (XIRR p.a.)`, '—', 'Insufficient history']); r.getCell(2).alignment = { horizontal: 'right' } }
+    }
   }
   ws.addRow([])
 
   section('RISK METRICS')
-  fRow('Annualized volatility (std dev)', `STDEV(${RET})*SQRT(252)`, rk.annualizedVol, FMT.pct, 'Sample (n-1) std dev × √252')
+  fRow('Standard deviation (daily)', `STDEV(${RET})`, rk.dailyStd, FMT.pct, 'Sample (n-1) std dev of daily returns')
+  fRow('Standard deviation (annualized)', `STDEV(${RET})*SQRT(252)`, rk.annualizedVol, FMT.pct, 'Daily std dev × √252 — headline volatility (Value Research / Morningstar convention)')
   const dsRow = fRow('Downside deviation', `SQRT(SUMPRODUCT(((${RET}-$B$2/252)<0)*((${RET}-$B$2/252)^2))/COUNT(${RET}))*SQRT(252)`, rk.downsideDeviation, FMT.pct, 'Volatility of below-target returns (annualized)')
   fRow('Sharpe ratio', `(AVERAGE(${RET})*252-$B$2)/(STDEV(${RET})*SQRT(252))`, rk.sharpe, FMT.ratio, 'Excess return per unit of total risk')
   fRow('Sortino ratio', `(AVERAGE(${RET})*252-$B$2)/$B$${dsRow}`, rk.sortino, FMT.ratio, 'Excess return per unit of downside risk')
@@ -202,9 +218,11 @@ function addSummarySheet(wb, meta, m) {
     ws.addRow(['Period', `${pe.startDate} → ${pe.endDate}`, `${pe.years.toFixed(2)} yrs · ${pe.observations} obs`])
     kv('Latest NAV', pe.endNav, FMT.nav)
     kv('CAGR', rm.cagr, FMT.pct)
+    kv('YTD return', rm.ytd?.value, FMT.pct)
     kv('1Y return', rm.trailing['1Y']?.value, FMT.pct)
     kv('3Y return (p.a.)', rm.trailing['3Y']?.value, FMT.pct)
-    kv('Annualized volatility', rk.annualizedVol, FMT.pct)
+    kv('SIP since-inception (XIRR)', rm.sip?.SI?.xirr, FMT.pct)
+    kv('Standard deviation (ann.)', rk.annualizedVol, FMT.pct)
     kv('Sharpe ratio', rk.sharpe, FMT.ratio)
     kv('Sortino ratio', rk.sortino, FMT.ratio)
     kv('Maximum drawdown', rk.maxDrawdown, FMT.pct)
@@ -232,6 +250,10 @@ function addBenchmarkSheet(wb, b, benchMeta) {
   put('Information ratio', b.informationRatio, FMT.ratio, 'Active return per unit of tracking error')
   put('Up-capture ratio', b.upCapture, FMT.ratio, `>100 = beats benchmark up-market (${b.upPeriods} months)`)
   put('Down-capture ratio', b.downCapture, FMT.ratio, `<100 = falls less down-market (${b.downPeriods} months)`)
+  put('Excess return over benchmark (p.a.)', b.excessReturn, FMT.pct, 'Fund CAGR − benchmark CAGR over the common window')
+  put('Rolling 1Y win rate', b.rollingWinRate1Y, FMT.pct, `% of 1Y windows the fund beat the benchmark (${b.rollingWindows1Y} windows)`)
+  put('Rolling 3Y win rate', b.rollingWinRate3Y, FMT.pct, `% of 3Y windows the fund beat the benchmark (${b.rollingWindows3Y} windows)`)
+  put('Calendar-year hit rate', b.yearlyHitRate, FMT.pct, `% of calendar years the fund beat the benchmark (${b.hitYears} yrs)`)
   return ws
 }
 
@@ -241,6 +263,60 @@ function addRollingSheet(wb, roll, label) {
   roll.values.forEach(v => { const r = ws.addRow({ v }); r.getCell('v').numFmt = FMT.pct })
   finishTable(ws, roll.values.length)
   greenRed(ws, 'A', roll.values.length)
+  return ws
+}
+
+/* ─────────────────────────── parameters reference ─── */
+// Full MF-analysis parameter taxonomy (qualitative + quantitative) from the
+// reference guide, with THIS tool's coverage flagged per parameter. Flat,
+// auto-filterable table so the user can slice by Part / Category / coverage.
+function addParametersSheet(wb) {
+  const ws = wb.addWorksheet('Parameters Reference', { views: [{ state: 'frozen', ySplit: 1 }] })
+  ws.columns = [
+    { header: 'Part', key: 'part', width: 17 },
+    { header: 'Category', key: 'cat', width: 30 },
+    { header: 'Parameter', key: 'param', width: 36 },
+    { header: 'Definition', key: 'def', width: 78 },
+    { header: 'In this report', key: 'cov', width: 15 },
+    { header: 'Where computed', key: 'where', width: 32 },
+  ]
+  const COV_COLOR = { yes: C.pos, partial: 'FFB8860B', no: C.note } // amber for partial
+  const writeRow = (vals, cov) => {
+    const row = ws.addRow(vals)
+    const c = COVERAGE[cov] || COVERAGE.no
+    const cell = row.getCell('cov')
+    cell.value = c.label
+    cell.font = { color: { argb: COV_COLOR[cov] || C.note }, bold: cov === 'yes' }
+    cell.alignment = { horizontal: 'center' }
+    row.getCell('def').alignment = { wrapText: true, vertical: 'top' }
+    row.getCell('param').font = { bold: true }
+    row.getCell('param').alignment = { vertical: 'top', wrapText: true }
+    row.getCell('where').alignment = { wrapText: true, vertical: 'top' }
+    return row
+  }
+  let count = 0
+  for (const p of PARAMETERS)
+    for (const s of p.sections)
+      for (const par of s.params) {
+        writeRow({ part: p.part, cat: s.name, param: par.name, def: par.def, where: par.where || '' }, par.cov)
+        count++
+      }
+  // addendum — metrics this tool computes beyond the reference guide
+  for (const e of EXTRA_METRICS) {
+    writeRow({ part: 'Beyond the guide', cat: 'Additional metrics', param: e.name, def: e.def, where: e.where }, 'yes')
+    count++
+  }
+  finishTable(ws, count) // header style + zebra + autofilter across data rows
+  // legend + source note below the table
+  ws.addRow([])
+  const legend = ws.addRow(['Legend', `${COVERAGE.yes.label} = computed   ${COVERAGE.partial.label} = partially / proxy   ${COVERAGE.no.label} = not derivable from NAV`])
+  legend.getCell(1).font = { bold: true }
+  legend.getCell(2).font = { color: { argb: C.note }, size: 10 }
+  const note = ws.addRow([REFERENCE_NOTE])
+  ws.mergeCells(`A${note.number}:F${note.number}`)
+  note.getCell(1).alignment = { wrapText: true, vertical: 'top' }
+  note.getCell(1).font = { italic: true, color: { argb: C.note }, size: 10 }
+  ws.getRow(note.number).height = 60
   return ws
 }
 
@@ -288,6 +364,7 @@ export async function buildWorkbook(rawData, meta, opts = {}) {
     const roll = rollingReturns(real, 365)
     if (roll && roll.count >= 10) addRollingSheet(wb, roll, '1Y')
   }
+  addParametersSheet(wb)
   return wb
 }
 
@@ -397,11 +474,14 @@ function addComparisonSheet(wb, pivot, rfr, benchSeries) {
   }
   section('Return')
   metricRow('CAGR', p => p.m?.returnMetrics.cagr, FMT.pct)
+  metricRow('YTD return', p => p.m?.returnMetrics.ytd?.value, FMT.pct)
   metricRow('1Y return', p => p.m?.returnMetrics.trailing['1Y']?.value, FMT.pct)
   metricRow('3Y return (p.a.)', p => p.m?.returnMetrics.trailing['3Y']?.value, FMT.pct)
   metricRow('5Y return (p.a.)', p => p.m?.returnMetrics.trailing['5Y']?.value, FMT.pct)
+  metricRow('10Y return (p.a.)', p => p.m?.returnMetrics.trailing['10Y']?.value, FMT.pct)
+  metricRow('SIP since-inception (XIRR)', p => p.m?.returnMetrics.sip?.SI?.xirr, FMT.pct)
   section('Risk')
-  metricRow('Annualized volatility', p => p.m?.riskMetrics.annualizedVol, FMT.pct)
+  metricRow('Standard deviation (ann.)', p => p.m?.riskMetrics.annualizedVol, FMT.pct)
   metricRow('Downside deviation', p => p.m?.riskMetrics.downsideDeviation, FMT.pct)
   metricRow('Sharpe ratio', p => p.m?.riskMetrics.sharpe, FMT.ratio)
   metricRow('Sortino ratio', p => p.m?.riskMetrics.sortino, FMT.ratio)
@@ -414,13 +494,46 @@ function addComparisonSheet(wb, pivot, rfr, benchSeries) {
     section('Vs benchmark')
     metricRow('Beta', p => p.b?.beta, FMT.ratio)
     metricRow('Alpha (p.a.)', p => p.b?.alpha, FMT.pct)
+    metricRow('Excess return (p.a.)', p => p.b?.excessReturn, FMT.pct)
     metricRow('R-squared', p => p.b?.rSquared, FMT.ratio)
     metricRow('Tracking error (p.a.)', p => p.b?.trackingError, FMT.pct)
     metricRow('Information ratio', p => p.b?.informationRatio, FMT.ratio)
     metricRow('Up-capture', p => p.b?.upCapture, FMT.ratio)
     metricRow('Down-capture', p => p.b?.downCapture, FMT.ratio)
+    metricRow('Rolling 1Y win rate', p => p.b?.rollingWinRate1Y, FMT.pct)
+    metricRow('Calendar-year hit rate', p => p.b?.yearlyHitRate, FMT.pct)
   }
-  const foot = ws.addRow([`Risk-free ${(rfr * 100).toFixed(2)}% · vol ×√252 · ${bench ? 'benchmark provided' : 'no benchmark'}`])
+
+  // Peer ranking within the selected set — a proxy for category-relative metrics
+  // (true category data isn't available from the NAV feed). 1 = best.
+  if (schemes.length >= 2) {
+    const arrRow = (label, arr, fmt) => {
+      const r = ws.addRow([label, ...arr.map(num)])
+      r.eachCell((c, i) => { if (i > 1) c.numFmt = fmt })
+    }
+    const rankDesc = (arr) => {
+      const order = arr.map((v, i) => ({ v, i })).filter(o => isFinite(o.v)).sort((a, b) => b.v - a.v)
+      const rank = arr.map(() => null)
+      order.forEach((o, idx) => { rank[o.i] = idx + 1 })
+      return rank
+    }
+    const pctile = (arr) => {
+      const valid = arr.filter(isFinite)
+      return arr.map(v => isFinite(v) && valid.length ? valid.filter(x => x <= v).length / valid.length : null)
+    }
+    const cagrs = per.map(p => p.m?.returnMetrics.cagr)
+    const sharpes = per.map(p => p.m?.riskMetrics.sharpe)
+    const validCagr = cagrs.filter(isFinite)
+    const setAvg = validCagr.length ? validCagr.reduce((a, b) => a + b, 0) / validCagr.length : null
+    section('Peer ranking (within selected set)')
+    arrRow('Set-average CAGR', cagrs.map(() => setAvg), FMT.pct)
+    arrRow('Excess vs set-average CAGR', cagrs.map(v => isFinite(v) && setAvg != null ? v - setAvg : null), FMT.pct)
+    arrRow('CAGR rank (1 = best)', rankDesc(cagrs), FMT.int)
+    arrRow('CAGR percentile', pctile(cagrs), FMT.pct)
+    arrRow('Sharpe rank (1 = best)', rankDesc(sharpes), FMT.int)
+  }
+
+  const foot = ws.addRow([`Risk-free ${(rfr * 100).toFixed(2)}% · vol ×√252 · ${bench ? 'benchmark provided' : 'no benchmark'} · peer ranks are within the selected set only`])
   foot.getCell(1).font = { italic: true, color: { argb: C.note }, size: 10 }
   return ws
 }
@@ -436,6 +549,7 @@ export async function buildAnalysisWorkbook(results, filteredSubsets = {}, opts 
   addRollingPivotSheet(wb, pivot, 3)
   addRollingPivotSheet(wb, pivot, 5)
   addPivotSheet(wb, 'Full NAV', pivot, false)
+  addParametersSheet(wb)
   return wb
 }
 
@@ -508,9 +622,11 @@ export function analysisSheetsForWebExcel(results, filteredSubsets = {}, opts = 
   const pct = (v) => (isFinite(v) ? +(v * 100).toFixed(2) : '')
   const cmp = [['METRIC', ...labels]]
   cmp.push(['CAGR %', ...per.map(p => pct(p.m?.returnMetrics.cagr))])
+  cmp.push(['YTD %', ...per.map(p => pct(p.m?.returnMetrics.ytd?.value))])
   cmp.push(['1Y %', ...per.map(p => pct(p.m?.returnMetrics.trailing['1Y']?.value))])
   cmp.push(['3Y % p.a.', ...per.map(p => pct(p.m?.returnMetrics.trailing['3Y']?.value))])
-  cmp.push(['Ann. volatility %', ...per.map(p => pct(p.m?.riskMetrics.annualizedVol))])
+  cmp.push(['SIP SI XIRR %', ...per.map(p => pct(p.m?.returnMetrics.sip?.SI?.xirr))])
+  cmp.push(['Std deviation % (ann.)', ...per.map(p => pct(p.m?.riskMetrics.annualizedVol))])
   cmp.push(['Sharpe', ...per.map(p => numD(p.m?.riskMetrics.sharpe, 2))])
   cmp.push(['Sortino', ...per.map(p => numD(p.m?.riskMetrics.sortino, 2))])
   cmp.push(['Max drawdown %', ...per.map(p => pct(p.m?.riskMetrics.maxDrawdown))])
@@ -519,8 +635,11 @@ export function analysisSheetsForWebExcel(results, filteredSubsets = {}, opts = 
   if (bench) {
     cmp.push(['Beta', ...per.map(p => numD(p.b?.beta, 3))])
     cmp.push(['Alpha % p.a.', ...per.map(p => pct(p.b?.alpha))])
+    cmp.push(['Excess return % p.a.', ...per.map(p => pct(p.b?.excessReturn))])
     cmp.push(['R-squared', ...per.map(p => numD(p.b?.rSquared, 3))])
     cmp.push(['Tracking error %', ...per.map(p => pct(p.b?.trackingError))])
+    cmp.push(['Rolling 1Y win rate %', ...per.map(p => pct(p.b?.rollingWinRate1Y))])
+    cmp.push(['Cal-year hit rate %', ...per.map(p => pct(p.b?.yearlyHitRate))])
   }
   const rowsToShow = latestStart ? dates.filter(d => d.date >= latestStart) : dates
   const navRows = [['Date', ...labels]]

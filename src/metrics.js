@@ -157,6 +157,13 @@ function navAtOrBefore(series, target) {
   return found
 }
 
+// NAV at-or-after a target date (nearest following business day). For SIP, you
+// buy on the first available NAV on/after each scheduled installment date.
+function navAtOrAfter(series, target) {
+  for (const p of series) if (p.date >= target) return p
+  return null
+}
+
 /**
  * Trailing return ending at the last observation, looking back `days` calendar
  * days. <=1 year -> absolute %, >1 year -> CAGR. Returns null if no data point
@@ -210,6 +217,113 @@ export function rollingReturns(series, windowDays) {
     std: sampleStd(out),
     pctPositive: out.filter(x => x > 0).length / out.length,
     values: out,
+  }
+}
+
+// Year-to-date return: last NAV of the previous calendar year → latest NAV.
+export function ytdReturn(series) {
+  if (series.length < 2) return null
+  const end = series[series.length - 1]
+  // Base = last NAV of the PRIOR calendar year. Target Dec-31 of last year so a
+  // NAV dated exactly Jan-1 of the current year is excluded from the base.
+  const prevYearEnd = new Date(end.date.getFullYear() - 1, 11, 31)
+  const start = navAtOrBefore(series, prevYearEnd)
+  if (!start || start.date >= end.date) return null
+  return { value: end.nav / start.nav - 1, startDate: start.raw, startNav: start.nav }
+}
+
+/* ─────────────────────────── SIP / XIRR ─── */
+
+/**
+ * XIRR — internal rate of return for irregular cash flows. Newton-Raphson with
+ * a bisection fallback (robust when Newton diverges). cashflows: ascending
+ * [{date:Date, amount:Number}] with at least one negative and one positive.
+ * Returns an annualized fraction (e.g. 0.143 = 14.3% p.a.), or NaN.
+ */
+export function xirr(cashflows) {
+  if (!Array.isArray(cashflows) || cashflows.length < 2) return NaN
+  const hasNeg = cashflows.some(c => c.amount < 0)
+  const hasPos = cashflows.some(c => c.amount > 0)
+  if (!hasNeg || !hasPos) return NaN
+  const t0 = cashflows[0].date.getTime()
+  const yf = (c) => (c.date.getTime() - t0) / (365 * 86400000) // Actual/365
+  const npv = (r) => cashflows.reduce((s, c) => s + c.amount / (1 + r) ** yf(c), 0)
+  const dnpv = (r) => cashflows.reduce((s, c) => { const t = yf(c); return s - (t * c.amount) / (1 + r) ** (t + 1) }, 0)
+
+  // Newton-Raphson
+  let r = 0.1
+  for (let i = 0; i < 100; i++) {
+    const f = npv(r), fp = dnpv(r)
+    if (!isFinite(f) || !isFinite(fp) || fp === 0) break
+    let rn = r - f / fp
+    if (rn <= -0.9999) rn = (r - 0.9999) / 2 // damp toward the -100% floor
+    if (Math.abs(rn - r) < 1e-8) return rn
+    r = rn
+  }
+  // Bisection fallback — grow the upper bracket geometrically until the NPV
+  // changes sign (so very high IRRs are still bracketed), then bisect.
+  let lo = -0.9999, hi = 1
+  let flo = npv(lo), fhi = npv(hi)
+  for (let g = 0; g < 40 && flo * fhi > 0 && hi < 1e6; g++) { hi *= 2; fhi = npv(hi) }
+  if (!isFinite(flo) || !isFinite(fhi) || flo * fhi > 0) {
+    const scale = Math.max(...cashflows.map(c => Math.abs(c.amount)), 1)
+    return isFinite(r) && Math.abs(npv(r)) < 1e-4 * scale ? r : NaN // scale-relative guard
+  }
+  for (let i = 0; i < 300; i++) {
+    const mid = (lo + hi) / 2, fm = npv(mid)
+    if (Math.abs(fm) < 1e-9 || (hi - lo) < 1e-10) return mid
+    if (flo * fm < 0) { hi = mid; fhi = fm } else { lo = mid; flo = fm }
+  }
+  return (lo + hi) / 2
+}
+
+/**
+ * SIP return: simulate a fixed monthly investment (default ₹10,000) bought on
+ * the first available NAV on/after each month's installment date, then solve
+ * XIRR over the contribution cash flows plus the terminal redemption value.
+ * `lookbackDays` null = since inception. Returns null if <2 installments fit or
+ * the requested window pre-dates available history (avoids mislabeled windows).
+ */
+export function sipReturn(series, lookbackDays = null, amount = 10000) {
+  if (!series || series.length < 2) return null
+  const end = series[series.length - 1]
+  const startBound = lookbackDays ? new Date(end.date.getTime() - lookbackDays * 86400000) : series[0].date
+  // Window pre-dates our data → don't pretend it's a full N-year SIP.
+  if (lookbackDays && series[0].date.getTime() > startBound.getTime() + 45 * 86400000) return null
+
+  const cfs = []
+  let units = 0, invested = 0
+  // Anchor the installment day-of-month and clamp to each month's last valid
+  // day, so a 29–31 start doesn't overflow into the next month (which would
+  // SKIP a month — e.g. Jan-31 → Mar-2 drops February — and permanently drift
+  // the buy day). Feb stays Feb-28/29; the anchor day is restored in long months.
+  const anchorDay = startBound.getDate()
+  const daysInMonth = (y, mo) => new Date(y, mo + 1, 0).getDate()
+  let y = startBound.getFullYear(), mo = startBound.getMonth()
+  let cur = new Date(y, mo, Math.min(anchorDay, daysInMonth(y, mo)))
+  // step month-by-month; buy on first NAV on/after each scheduled date
+  while (cur <= end.date) {
+    const p = navAtOrAfter(series, cur)
+    if (p && p.date <= end.date) {
+      units += amount / p.nav
+      invested += amount
+      cfs.push({ date: p.date, amount: -amount })
+    }
+    mo += 1
+    if (mo > 11) { mo = 0; y += 1 }
+    cur = new Date(y, mo, Math.min(anchorDay, daysInMonth(y, mo)))
+  }
+  if (cfs.length < 2) return null
+  const finalValue = units * end.nav
+  cfs.push({ date: end.date, amount: finalValue })
+  const annualized = xirr(cfs)
+  return {
+    xirr: annualized,
+    invested,
+    finalValue,
+    gain: finalValue - invested,
+    absoluteReturn: invested > 0 ? finalValue / invested - 1 : NaN,
+    installments: cfs.length - 1,
   }
 }
 
@@ -289,8 +403,18 @@ export function computeMetrics(series, rfAnnual = 0.0525) {
     '1Y': trailingReturn(series, 365),
     '3Y': trailingReturn(series, 365 * 3),
     '5Y': trailingReturn(series, 365 * 5),
+    '10Y': trailingReturn(series, 365 * 10),
   }
   const rolling1Y = rollingReturns(series, 365)
+  const rolling3Y = rollingReturns(series, 365 * 3)
+  const rolling5Y = rollingReturns(series, 365 * 5)
+  const ytd = ytdReturn(series)
+  const sip = {
+    '1Y': sipReturn(series, 365),
+    '3Y': sipReturn(series, 365 * 3),
+    '5Y': sipReturn(series, 365 * 5),
+    'SI': sipReturn(series, null), // since inception (of available data)
+  }
 
   return {
     rfAnnual,
@@ -306,11 +430,23 @@ export function computeMetrics(series, rfAnnual = 0.0525) {
       meanDaily: mDaily,
       bestDay: Math.max(...rets),
       worstDay: Math.min(...rets),
+      ytd,
       trailing,
+      sip,
       rolling1Y: rolling1Y && {
         average: rolling1Y.average, median: rolling1Y.median,
         min: rolling1Y.min, max: rolling1Y.max, std: rolling1Y.std,
         pctPositive: rolling1Y.pctPositive, count: rolling1Y.count,
+      },
+      rolling3Y: rolling3Y && {
+        average: rolling3Y.average, median: rolling3Y.median,
+        min: rolling3Y.min, max: rolling3Y.max, std: rolling3Y.std,
+        pctPositive: rolling3Y.pctPositive, count: rolling3Y.count,
+      },
+      rolling5Y: rolling5Y && {
+        average: rolling5Y.average, median: rolling5Y.median,
+        min: rolling5Y.min, max: rolling5Y.max, std: rolling5Y.std,
+        pctPositive: rolling5Y.pctPositive, count: rolling5Y.count,
       },
     },
     riskMetrics: {
@@ -393,10 +529,64 @@ export function computeBenchmarkMetrics(fundSeries, benchSeries, rfAnnual = 0.05
   const upCapture = up.b !== 0 ? (up.f / up.b) * 100 : NaN
   const downCapture = down.b !== 0 ? (down.f / down.b) * 100 : NaN
 
+  // raw excess return over benchmark: geometric (CAGR) over the common window
+  const yrs = yearsBetween(dates[0], dates[dates.length - 1])
+  let excessReturn = NaN, cagrFund = NaN, cagrBench = NaN
+  if (yrs >= 0.25) {
+    cagrFund = (f[f.length - 1] / f[0]) ** (1 / yrs) - 1
+    cagrBench = (b[b.length - 1] / b[0]) ** (1 / yrs) - 1
+    excessReturn = cagrFund - cagrBench
+  }
+
+  // rolling-window consistency: % of N-year windows where the fund beats the
+  // benchmark (point-to-point return over each window). And calendar-year hit
+  // rate: % of years the fund's return exceeded the benchmark's.
+  const win1Y = rollingWinRate(dates, f, b, 365)
+  const win3Y = rollingWinRate(dates, f, b, 365 * 3)
+  const hit = yearlyHitRate(dates, f, b)
+
   return {
     pairs, beta, alpha, rSquared, treynor,
     trackingError, informationRatio: infoRatio,
     upCapture, downCapture,
     upPeriods: up.k, downPeriods: down.k, // months
+    excessReturn, cagrFund, cagrBench,
+    rollingWinRate1Y: win1Y ? win1Y.rate : NaN, rollingWindows1Y: win1Y ? win1Y.windows : 0,
+    rollingWinRate3Y: win3Y ? win3Y.rate : NaN, rollingWindows3Y: win3Y ? win3Y.windows : 0,
+    yearlyHitRate: hit ? hit.rate : NaN, hitYears: hit ? hit.years : 0,
   }
+}
+
+// % of rolling `windowDays` windows where fund point-to-point return > benchmark.
+function rollingWinRate(dates, f, b, windowDays) {
+  const wMs = windowDays * 86400000
+  const lastMs = dates[dates.length - 1].getTime()
+  let win = 0, tot = 0
+  for (let i = 0; i < dates.length; i++) {
+    const target = dates[i].getTime() + wMs
+    if (target > lastMs) break
+    let j = -1
+    for (let k = i + 1; k < dates.length; k++) { if (dates[k].getTime() >= target) { j = k; break } }
+    if (j < 0) continue
+    const fr = f[j] / f[i] - 1, br = b[j] / b[i] - 1
+    if (isFinite(fr) && isFinite(br)) { tot++; if (fr > br) win++ }
+  }
+  return tot ? { rate: win / tot, windows: tot } : null
+}
+
+// % of calendar years where fund's intra-year return beat the benchmark's.
+function yearlyHitRate(dates, f, b) {
+  const byYear = new Map()
+  dates.forEach((d, i) => {
+    const y = d.getFullYear()
+    if (!byYear.has(y)) byYear.set(y, { first: i, last: i })
+    else byYear.get(y).last = i
+  })
+  let win = 0, tot = 0
+  for (const { first, last } of byYear.values()) {
+    if (last <= first) continue
+    const fr = f[last] / f[first] - 1, br = b[last] / b[first] - 1
+    if (isFinite(fr) && isFinite(br)) { tot++; if (fr > br) win++ }
+  }
+  return tot ? { rate: win / tot, years: tot } : null
 }
