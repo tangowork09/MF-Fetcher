@@ -168,8 +168,12 @@ function navAtOrAfter(series, target) {
  * Trailing return ending at the last observation, looking back `days` calendar
  * days. <=1 year -> absolute %, >1 year -> CAGR. Returns null if no data point
  * old enough exists.
+ * @param {Number} nominalYears  when annualizing, exponent = 1/nominalYears
+ *   (flat 1/3/5/10) instead of 1/actual-elapsed-years — matches how AMFI/
+ *   Value Research quote "3Y return" regardless of exact weekend/holiday drift
+ *   in the matched start date.
  */
-export function trailingReturn(series, days) {
+export function trailingReturn(series, days, nominalYears = null) {
   if (series.length < 2) return null
   const end = series[series.length - 1]
   const targetMs = end.date.getTime() - days * 86400000
@@ -181,7 +185,8 @@ export function trailingReturn(series, days) {
   const yrs = yearsBetween(start.date, end.date)
   const annualized = yrs > 1 // ≤1y → absolute, >1y → CAGR (SEBI/AMFI convention)
   const ratio = end.nav / start.nav
-  const value = annualized ? ratio ** (1 / yrs) - 1 : ratio - 1
+  const n = nominalYears || yrs
+  const value = annualized ? ratio ** (1 / n) - 1 : ratio - 1
   return { value, annualized, startDate: start.raw, startNav: start.nav, years: yrs }
 }
 
@@ -400,10 +405,10 @@ export function computeMetrics(series, rfAnnual = 0.0525) {
     '1M': trailingReturn(series, 30),
     '3M': trailingReturn(series, 91),
     '6M': trailingReturn(series, 182),
-    '1Y': trailingReturn(series, 365),
-    '3Y': trailingReturn(series, 365 * 3),
-    '5Y': trailingReturn(series, 365 * 5),
-    '10Y': trailingReturn(series, 365 * 10),
+    '1Y': trailingReturn(series, 365, 1),
+    '3Y': trailingReturn(series, 365 * 3, 3),
+    '5Y': trailingReturn(series, 365 * 5, 5),
+    '10Y': trailingReturn(series, 365 * 10, 10),
   }
   const rolling1Y = rollingReturns(series, 365)
   const rolling3Y = rollingReturns(series, 365 * 3)
