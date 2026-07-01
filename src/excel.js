@@ -39,6 +39,11 @@ function styleSectionCell(cell) {
   cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: C.section } }
 }
 const num = (v) => (isFinite(v) ? v : null)
+// Excel/ExcelJS serializes Date cells by their UTC calendar date. Our Date
+// objects are LOCAL midnight (parseNavDate), so on any machine east of UTC
+// (e.g. IST) the stored date shifts back a day on open. Re-anchor to UTC
+// midnight of the same y/m/d so the displayed date matches the real NAV date.
+const xlDate = (d) => new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
 
 /* ═══════════════════════════ PER-SCHEME WORKBOOK ═══════════════════════════ */
 
@@ -60,7 +65,7 @@ function addNavHistorySheet(wb, display) {
   let peak = -Infinity
   display.forEach((p, i) => {
     peak = Math.max(peak, p.nav)
-    ws.addRow({ d: p.date, n: p.nav, r: i === 0 ? null : rets[i - 1], g: 100 * (p.nav / base), p: peak, dd: p.nav / peak - 1 })
+    ws.addRow({ d: xlDate(p.date), n: p.nav, r: i === 0 ? null : rets[i - 1], g: 100 * (p.nav / base), p: peak, dd: p.nav / peak - 1 })
   })
   ws.getColumn('d').numFmt = FMT.date
   ws.getColumn('n').numFmt = FMT.nav
@@ -90,7 +95,7 @@ function addTradingDaysSheet(wb, real) {
   real.forEach((p, i) => {
     const excelRow = i + 2 // data starts at row 2
     peak = Math.max(peak, p.nav)
-    const row = ws.addRow({ d: p.date, n: p.nav })
+    const row = ws.addRow({ d: xlDate(p.date), n: p.nav })
     if (i > 0) row.getCell('r').value = { formula: `B${excelRow}/B${excelRow - 1}-1`, result: rets[i - 1] }
     row.getCell('dd').value = { formula: `B${excelRow}/MAX($B$2:B${excelRow})-1`, result: p.nav / peak - 1 }
   })
@@ -407,7 +412,7 @@ function addPivotSheet(wb, name, { schemes, dates, latestStart }, trimmed) {
   hdr.eachCell(styleHeaderCell)
   const rowsToShow = trimmed && latestStart ? dates.filter(d => d.date >= latestStart) : dates
   rowsToShow.forEach(({ raw, date }) => {
-    const row = ws.addRow([date, ...schemes.map(s => { const v = s.byRaw.get(raw); return v != null ? v : null })])
+    const row = ws.addRow([xlDate(date), ...schemes.map(s => { const v = s.byRaw.get(raw); return v != null ? v : null })])
     row.getCell(1).numFmt = FMT.date
     for (let c = 2; c <= schemes.length + 1; c++) row.getCell(c).numFmt = FMT.nav
   })
@@ -424,7 +429,7 @@ function addRollingPivotSheet(wb, { schemes, dates, latestStart }, years) {
   const starts = latestStart ? dates.filter(d => d.date >= latestStart) : dates
   starts.forEach(({ raw, date }) => {
     const targetMs = date.getTime() + windowMs
-    const cells = [date]; let any = false
+    const cells = [xlDate(date)]; let any = false
     schemes.forEach((s, si) => {
       const startNav = s.byRaw.get(raw)
       if (startNav == null || startNav === 0) { cells.push(null); return }
