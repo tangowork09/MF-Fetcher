@@ -94,10 +94,10 @@ function HistoryPanel(_, ref) {
     await run(async () => downloadExcel(data, meta, filename, await resolveOpts(false)))
   }, [run, resolveOpts])
 
-  const handleBulkZip = () => run(async () => downloadBulkZip(scopedResults(), await resolveOpts(true)))
-  const handleComparison = () => run(async () => downloadAnalysisXlsx(scopedResults(), bulkScope === 'filter' ? {} : filteredSubsets, await resolveOpts(false)))
+  const handleBulkZip = () => run(async () => downloadBulkZip(scopedResults(), await resolveOpts(bulkScope === 'filter')))
+  const handleComparison = () => run(async () => downloadAnalysisXlsx(scopedResults(), bulkScope === 'filter' ? filteredSubsets : {}, await resolveOpts(false)))
   const handleWebExcel = () => run(async () => {
-    const sheets = analysisSheetsForWebExcel(scopedResults(), bulkScope === 'filter' ? {} : filteredSubsets, await resolveOpts(false))
+    const sheets = analysisSheetsForWebExcel(scopedResults(), bulkScope === 'filter' ? filteredSubsets : {}, await resolveOpts(false))
     sheets.forEach(s => webExcelStore.addSheet(s.name, s.rows, []))
   })
 
