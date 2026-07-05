@@ -14,7 +14,10 @@ export default function NavResult({ data, startDate, endDate, onFilteredDataChan
   const [priceFilter, setPriceFilter] = useState('')
 
   const filteredData = useMemo(() => navData.filter(row => {
-    const dMatch = row.date.toLowerCase().includes(dateFilter.toLowerCase())
+    const df = dateFilter.toLowerCase()
+    const [dd, mm, yyyy] = row.date.split('-')
+    const iso = `${yyyy}-${mm}-${dd}`
+    const dMatch = row.date.toLowerCase().includes(df) || iso.includes(df)
     const pMatch = row.nav.toLowerCase().includes(priceFilter.toLowerCase())
     return dMatch && pMatch
   }), [navData, dateFilter, priceFilter])
@@ -56,8 +59,8 @@ export default function NavResult({ data, startDate, endDate, onFilteredDataChan
           <span className={styles.exportCount}>{filteredData.length.toLocaleString()} rows</span>
         </div>
         <p className={styles.exportManifest}>
-          Workbook with <b>Summary</b>, <b>NAV History</b> (real dates — sort &amp; filter),
-          and <b>Risk &amp; Return Metrics</b> (live formulas){hasBench ? <>, plus a <b>Benchmark</b> tab</> : null}.
+          Workbook with <b>Summary</b>, <b>NAV History</b> (complete history since inception — sort &amp; filter),
+          and <b>Risk &amp; Return Metrics</b> (live formulas, computed on your selected range/filter){hasBench ? <>, plus a <b>Benchmark</b> tab</> : null}.
         </p>
         <div className={styles.exportActions}>
           <Btn small loading={busy} onClick={handleDownload}>⬇ Download Excel{isFiltered ? ' — current filter' : ''}</Btn>
@@ -65,8 +68,8 @@ export default function NavResult({ data, startDate, endDate, onFilteredDataChan
         </div>
         {isFiltered && (
           <p className={styles.exportNote}>
-            Exporting your current filter{filterLabel ? ` (${filterLabel})` : ''}: {filteredData.length.toLocaleString()} of {navData.length.toLocaleString()} rows.
-            Clear the filters above to export the full history.
+            Metrics will be computed on your current filter{filterLabel ? ` (${filterLabel})` : ''}: {filteredData.length.toLocaleString()} of {navData.length.toLocaleString()} rows.
+            The NAV History sheet always contains the fund’s complete history.
           </p>
         )}
       </div>

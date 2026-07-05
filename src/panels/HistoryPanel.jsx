@@ -45,7 +45,7 @@ function AnalyticsOptions({ rfr, setRfr, benchSel, setBenchSel, customCode, setC
         <p className={styles.optNote}>
           Risk-free rate drives Sharpe / Sortino / Treynor (default 5.25% ≈ RBI repo, Jun 2026). The benchmark is a real
           index-fund NAV (Total-Return proxy) fetched from the same API — it adds beta, alpha, R², tracking error and
-          capture ratios. Std dev is the sample (n-1) daily std dev annualized ×√252.
+          capture ratios. Std dev is the sample (n-1) daily std dev annualized by the fund&apos;s NAV cadence (√252 business-day, √365 daily-NAV).
         </p>
       </div>
     </details>
@@ -91,8 +91,15 @@ function HistoryPanel(_, ref) {
     : results
 
   const downloadOne = useCallback(async (data, meta, filename) => {
-    await run(async () => downloadExcel(data, meta, filename, await resolveOpts(false)))
-  }, [run, resolveOpts])
+    await run(async () => {
+      const opts = await resolveOpts(false)
+      // NAV History sheet always carries the complete history, even when the
+      // fetch range / client filters narrowed `data` (the metrics basis).
+      const src = results?.find(r => String(r.meta.scheme_code) === String(meta.scheme_code))
+      if (src?.fullData) opts.fullData = src.fullData
+      return downloadExcel(data, meta, filename, opts)
+    })
+  }, [run, resolveOpts, results])
 
   const handleBulkZip = () => run(async () => downloadBulkZip(scopedResults(), await resolveOpts(bulkScope === 'filter')))
   const handleComparison = () => run(async () => downloadAnalysisXlsx(scopedResults(), bulkScope === 'filter' ? filteredSubsets : {}, await resolveOpts(false)))
@@ -123,7 +130,13 @@ function HistoryPanel(_, ref) {
 
   const fetch_ = async (e) => {
     e?.preventDefault()
-    const validRows = rows.filter(r => r.val.trim())
+    const seen = new Set()
+    const validRows = rows.filter(r => {
+      const code = r.val.trim()
+      if (!code || seen.has(code)) return false
+      seen.add(code)
+      return true
+    })
     if (validRows.length === 0) return
     setLoading(true); setError(null); setResults(null)
     try {
@@ -136,6 +149,7 @@ function HistoryPanel(_, ref) {
       if (validResults.length === 0) setError('No NAV data for those codes. Check the scheme codes and try again.')
       else {
         setResults(validResults)
+        setFilteredSubsets({})
         if (validResults.length < validRows.length) setError(`${validRows.length - validResults.length} of ${validRows.length} codes returned no data and were skipped.`)
       }
     } catch {

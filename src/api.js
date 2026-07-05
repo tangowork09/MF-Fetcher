@@ -52,6 +52,21 @@ function sanitizeCode(code) {
   return cleaned
 }
 
+// Range-slice locally. start/end are 'yyyy-mm-dd' (HTML date inputs); row dates
+// are 'dd-mm-yyyy' — convert to ISO so plain string compare orders correctly.
+function toISO(ddmmyyyy) {
+  const [d, m, y] = ddmmyyyy.split('-')
+  return `${y}-${m}-${d}`
+}
+function sliceByRange(rows, startDate, endDate) {
+  return rows.filter(r => {
+    const iso = toISO(r.date)
+    if (startDate && iso < startDate) return false
+    if (endDate && iso > endDate) return false
+    return true
+  })
+}
+
 export const api = {
   search: (q) =>
     safeFetch(`${BASE}/mf/search?q=${encodeURIComponent(q)}`),
@@ -62,15 +77,17 @@ export const api = {
     return safeFetch(`${BASE}/mf?limit=${safeLimit}&offset=${safeOffset}`)
   },
 
+  // Always fetch the COMPLETE history (no server-side range params) so exports
+  // can include every NAV that ever existed. The requested range is sliced
+  // locally: `data` = range view, `fullData` = complete filled series.
   history: (code, startDate, endDate) => {
     const safeCode = sanitizeCode(code)
-    let url = `${BASE}/mf/${safeCode}`
-    const params = new URLSearchParams()
-    if (startDate) params.set('startDate', startDate)
-    if (endDate) params.set('endDate', endDate)
-    const qs = params.toString()
-    return safeFetch(qs ? `${url}?${qs}` : url).then(res => {
-      if (res && res.status === 'SUCCESS' && res.data) res.data = fillMissingDates(res.data)
+    return safeFetch(`${BASE}/mf/${safeCode}`).then(res => {
+      if (res && res.status === 'SUCCESS' && res.data) {
+        const full = fillMissingDates(res.data)
+        res.fullData = full
+        res.data = (startDate || endDate) ? sliceByRange(full, startDate, endDate) : full
+      }
       return res
     })
   },

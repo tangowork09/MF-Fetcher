@@ -119,6 +119,9 @@ function addMetricsSheet(wb, m, lastRow) {
   const B0 = `${TD}!B2`, BL = `${TD}!B${lastRow}`
   const A0 = `${TD}!A2`, AL = `${TD}!A${lastRow}`
   const rm = m.returnMetrics, rk = m.riskMetrics, pe = m.period
+  // annualization basis mirrors metrics.js detection: 252 business-day series,
+  // 365 for daily-NAV (overnight/liquid) funds — formulas must match cache
+  const PPY = m.periodsPerYear || 252
 
   const title = ws.addRow(['RISK & RETURN METRICS']); title.getCell(1).font = { bold: true, size: 13, color: { argb: C.header } }
   const rfRow = ws.addRow(['Risk-free rate (annual)', num(m.rfAnnual), 'EDITABLE — Sharpe / Sortino / Treynor recalc when you change this cell'])
@@ -128,7 +131,7 @@ function addMetricsSheet(wb, m, lastRow) {
   rfRow.getCell(1).font = { bold: true }
   // Formulas reference $B$2 directly (not a named range) — universal across
   // Excel / LibreOffice / Google Sheets.
-  ws.addRow(['Annualization basis', '252 trading days', 'Daily volatility annualized by √252'])
+  ws.addRow(['Annualization basis', PPY === 365 ? '365 calendar days (daily-NAV fund)' : PPY === 252 ? '252 trading days' : `${PPY} NAV days/yr (observed cadence)`, `Daily volatility annualized by √${PPY}`])
   ws.addRow(['Analysis period', `${pe.startDate} → ${pe.endDate}`, `${pe.observations} obs · ${pe.returns} returns · ${pe.years.toFixed(2)} yrs`])
   ws.addRow([])
 
@@ -151,7 +154,7 @@ function addMetricsSheet(wb, m, lastRow) {
   const cagrRow = pe.years >= 0.25
     ? fRow('CAGR (annualized)', `(${BL}/${B0})^(365.25/(${AL}-${A0}))-1`, rm.cagr, FMT.pct, 'Compound annual growth rate (geometric)')
     : vRow('Period return (absolute)', rm.absoluteReturn, FMT.pct, 'Span < 3 months — not annualized')
-  fRow('Annualized return (arithmetic)', `AVERAGE(${RET})*252`, rm.annualizedArithmetic, FMT.pct, 'Mean daily return × 252')
+  fRow('Annualized return (arithmetic)', `AVERAGE(${RET})*${PPY}`, rm.annualizedArithmetic, FMT.pct, `Mean daily return × ${PPY}`)
   fRow('Mean daily return', `AVERAGE(${RET})`, rm.meanDaily, FMT.pct, 'Average daily simple return')
   fRow('Best day', `MAX(${RET})`, rm.bestDay, FMT.pct, 'Largest single-day gain')
   fRow('Worst day', `MIN(${RET})`, rm.worstDay, FMT.pct, 'Largest single-day loss')
@@ -182,12 +185,23 @@ function addMetricsSheet(wb, m, lastRow) {
 
   section('RISK METRICS')
   fRow('Standard deviation (daily)', `STDEV(${RET})`, rk.dailyStd, FMT.pct, 'Sample (n-1) std dev of daily returns')
-  fRow('Standard deviation (annualized)', `STDEV(${RET})*SQRT(252)`, rk.annualizedVol, FMT.pct, 'Daily std dev × √252 — headline volatility (Value Research / Morningstar convention)')
-  const dsRow = fRow('Downside deviation', `SQRT(SUMPRODUCT(((${RET}-$B$2/252)<0)*((${RET}-$B$2/252)^2))/COUNT(${RET}))*SQRT(252)`, rk.downsideDeviation, FMT.pct, 'Volatility of below-target returns (annualized)')
-  fRow('Sharpe ratio', `(AVERAGE(${RET})*252-$B$2)/(STDEV(${RET})*SQRT(252))`, rk.sharpe, FMT.ratio, 'Excess return per unit of total risk')
-  fRow('Sortino ratio', `(AVERAGE(${RET})*252-$B$2)/$B$${dsRow}`, rk.sortino, FMT.ratio, 'Excess return per unit of downside risk')
+  fRow('Standard deviation (annualized)', `STDEV(${RET})*SQRT(${PPY})`, rk.annualizedVol, FMT.pct, `Daily std dev × √${PPY} — headline volatility (Value Research / Morningstar convention)`)
+  const dsRow = fRow('Downside deviation', `SQRT(SUMPRODUCT(((${RET}-$B$2/${PPY})<0)*((${RET}-$B$2/${PPY})^2))/COUNT(${RET}))*SQRT(${PPY})`, rk.downsideDeviation, FMT.pct, 'Volatility of below-target returns (annualized)')
+  // IFERROR guards: a flat series (STDEV=0), zero downside deviation, or a
+  // monotonically rising NAV (MDD=0 — normal for liquid/overnight funds) would
+  // otherwise recalc to #DIV/0! on open, while the JS-cached value is blank.
+  fRow('Sharpe ratio', `IFERROR((AVERAGE(${RET})*${PPY}-$B$2)/(STDEV(${RET})*SQRT(${PPY})),"")`, rk.sharpe, FMT.ratio, 'Excess return per unit of total risk')
+  fRow('Sortino ratio', `IFERROR((AVERAGE(${RET})*${PPY}-$B$2)/$B$${dsRow},"")`, rk.sortino, FMT.ratio, 'Excess return per unit of downside risk')
   const mddRow = fRow('Maximum drawdown', `-MIN(${DD})`, rk.maxDrawdown, FMT.pct, `Worst decline (${rk.maxDrawdownPeak || '—'} → ${rk.maxDrawdownTrough || '—'})`)
-  fRow('Calmar ratio', `$B$${cagrRow}/$B$${mddRow}`, rk.calmar, FMT.ratio, 'CAGR per unit of max drawdown')
+  // Calmar only when CAGR exists (span ≥ 3 months) — the fallback row holds
+  // the NON-annualized period return; dividing it by MDD and labeling the
+  // result "CAGR per unit of max drawdown" would fabricate a wrong ratio.
+  if (pe.years >= 0.25) {
+    fRow('Calmar ratio', `IFERROR($B$${cagrRow}/$B$${mddRow},"")`, rk.calmar, FMT.ratio, 'CAGR per unit of max drawdown')
+  } else {
+    const r = ws.addRow(['Calmar ratio', '—', 'Span < 3 months — CAGR undefined, Calmar not computed'])
+    r.getCell(2).alignment = { horizontal: 'right' }
+  }
   fRow('Value at Risk 95% (1-day, hist.)', `-PERCENTILE(${RET},0.05)`, rk.var95Hist, FMT.pct, 'Empirical 5th-percentile daily loss')
   fRow('Value at Risk 99% (1-day, hist.)', `-PERCENTILE(${RET},0.01)`, rk.var99Hist, FMT.pct, 'Empirical 1st-percentile daily loss')
   fRow('Value at Risk 95% (1-day, param.)', `-(AVERAGE(${RET})+(-1.6448536269514722)*STDEV(${RET}))`, rk.var95Param, FMT.pct, 'Normal-distribution 95% daily VaR')
@@ -350,7 +364,10 @@ function greenRed(ws, col, dataRows) {
 export async function buildWorkbook(rawData, meta, opts = {}) {
   const rfr = isFinite(opts.rfr) ? opts.rfr : 0.0525
   const real = toSeries(rawData)
-  const display = toDisplaySeries(rawData)
+  // NAV History always lists the COMPLETE history of the fund (opts.fullData)
+  // regardless of any date-range / filter selection; Trading Days + metrics
+  // stay on the selected range so range analysis still works.
+  const display = toDisplaySeries(Array.isArray(opts.fullData) && opts.fullData.length ? opts.fullData : rawData)
   const ExcelJS = await loadExcelJS()
   const wb = new ExcelJS.Workbook()
   wb.calcProperties.fullCalcOnLoad = true
@@ -538,7 +555,7 @@ function addComparisonSheet(wb, pivot, rfr, benchSeries) {
     arrRow('Sharpe rank (1 = best)', rankDesc(sharpes), FMT.int)
   }
 
-  const foot = ws.addRow([`Risk-free ${(rfr * 100).toFixed(2)}% · vol ×√252 · ${bench ? 'benchmark provided' : 'no benchmark'} · peer ranks are within the selected set only`])
+  const foot = ws.addRow([`Risk-free ${(rfr * 100).toFixed(2)}% · vol ×√(NAV cadence: 252 business-day, 365 daily, else observed obs/yr) · ${bench ? 'benchmark provided' : 'no benchmark'} · peer ranks are within the selected set only`])
   foot.getCell(1).font = { italic: true, color: { argb: C.note }, size: 10 }
   return ws
 }
@@ -553,7 +570,10 @@ export async function buildAnalysisWorkbook(results, filteredSubsets = {}, opts 
   addPivotSheet(wb, 'Trimmed + ATH', pivot, true)
   addRollingPivotSheet(wb, pivot, 3)
   addRollingPivotSheet(wb, pivot, 5)
-  addPivotSheet(wb, 'Full NAV', pivot, false)
+  // Full NAV = every NAV that ever existed per scheme, ignoring range/filter.
+  const hasFull = results.some(r => Array.isArray(r.fullData) && r.fullData.length)
+  const fullPivot = hasFull ? buildPivot(results.map(r => ({ ...r, data: r.fullData || r.data })), {}) : pivot
+  addPivotSheet(wb, 'Full NAV', fullPivot, false)
   addParametersSheet(wb)
   return wb
 }
@@ -583,7 +603,7 @@ export async function downloadBulkZip(results, opts = {}) {
   for (const res of results) {
     const { meta, data, reqStart, reqEnd } = res
     const datePart = (reqStart || reqEnd) ? `${reqStart || ''}-${reqEnd || ''}`.replace(/^-|-$/g, '') : 'all'
-    const wb = await buildWorkbook(data, meta, opts)
+    const wb = await buildWorkbook(data, meta, { ...opts, fullData: res.fullData })
     zip.file(sanitizeFilename(`${meta.scheme_code} - ${meta.scheme_name} - ${datePart}.xlsx`), await wbBuffer(wb))
   }
   if (results.length > 1) {

@@ -5,10 +5,10 @@
  * Morningstar India methodology (verified against primary sources):
  *   - Periodic returns are SIMPLE: r_t = NAV_t / NAV_{t-1} - 1
  *   - CAGR / annualized return is GEOMETRIC
- *   - Standard deviation is the SAMPLE (n-1) std dev, annualized by sqrt(252)
- *     because Indian MF NAVs are published on ~252 business days/year.
- *     (Annualizing by sqrt(365) over-states volatility by ~20% — this, plus
- *     the old flat-fill of weekend NAVs, was the std-dev bug.)
+ *   - Standard deviation is the SAMPLE (n-1) std dev, annualized by the
+ *     detected NAV cadence: sqrt(252) for business-day funds, sqrt(365) for
+ *     7-day daily-NAV funds, sqrt(observed obs/yr) for mixed cadences
+ *     (see detectPeriodsPerYear). Flat-filled weekend NAVs are excluded.
  *   - Distribution stats (skew, excess kurtosis) match Excel SKEW / KURT.
  *   - Historical VaR/CVaR use the empirical return distribution.
  *
@@ -16,6 +16,24 @@
  */
 
 export const TRADING_DAYS = 252
+
+/**
+ * Annualization basis from observation density. Snap to the two market
+ * conventions when the cadence clearly matches (business-day ≈252/yr,
+ * full-calendar ≈365/yr); otherwise use the OBSERVED frequency. Real funds
+ * sit in between — e.g. Baroda overnight publishes ~296 NAVs/yr via mfapi
+ * (roughly 6 days/wk): snapping it to 252 understates annualized return
+ * (Sharpe −6.5 on a 5.13%-CAGR fund) while snapping to 365 overstates it
+ * (Sharpe +5). mean(ret)×observed-frequency is the only sum that telescopes
+ * to the true annual return regardless of publication cadence.
+ */
+export function detectPeriodsPerYear(nReturns, years) {
+  if (!(years > 0) || !(nReturns > 0)) return TRADING_DAYS
+  const obsPerYear = nReturns / years
+  if (obsPerYear >= 340) return 365 // 7-day daily-NAV fund
+  if (obsPerYear >= 230 && obsPerYear <= 270) return TRADING_DAYS // business-day fund
+  return Math.max(1, Math.round(obsPerYear)) // mixed / sparse cadence → observed
+}
 
 /* ─────────────────────────── parsing / shaping ─── */
 
@@ -180,8 +198,12 @@ export function trailingReturn(series, days, nominalYears = null) {
   const start = navAtOrBefore(series, new Date(targetMs))
   if (!start || start.date >= end.date) return null
   // reject if the matched start is far earlier than the requested lookback
-  // (data doesn't actually reach back that far) — avoids mislabeled returns
-  if (targetMs - start.date.getTime() > 45 * 86400000) return null
+  // (data doesn't actually reach back that far) — avoids mislabeled returns.
+  // Tolerance scales with the window: a "1M return" may drift a few days over
+  // a weekend/holiday, not 45 — a flat 45-day guard let a 30-day lookback
+  // report a 70-day return.
+  const maxDriftDays = Math.max(7, Math.min(45, Math.round(days * 0.125)))
+  if (targetMs - start.date.getTime() > maxDriftDays * 86400000) return null
   const yrs = yearsBetween(start.date, end.date)
   const annualized = yrs > 1 // ≤1y → absolute, >1y → CAGR (SEBI/AMFI convention)
   const ratio = end.nav / start.nav
@@ -208,6 +230,11 @@ export function rollingReturns(series, windowDays) {
       if (series[j].date >= endTarget) { endP = series[j]; break }
     }
     if (!endP) continue
+    // Gap guard: if the matched end drifts far past the window target (a NAV
+    // publication hole), the window no longer represents `windowDays` — a
+    // "+20% over 18 months" move would pollute the 1Y distribution as a
+    // "+20% 1Y window". Normal weekend/holiday drift is ≤ ~5 days.
+    if (endP.date.getTime() - endTarget.getTime() > 10 * 86400000) continue
     const yrs = yearsBetween(startP.date, endP.date)
     const ratio = endP.nav / startP.nav
     out.push(windowDays > 366 ? ratio ** (1 / yrs) - 1 : ratio - 1)
@@ -256,13 +283,19 @@ export function xirr(cashflows) {
   const dnpv = (r) => cashflows.reduce((s, c) => { const t = yf(c); return s - (t * c.amount) / (1 + r) ** (t + 1) }, 0)
 
   // Newton-Raphson
+  const scale = Math.max(...cashflows.map(c => Math.abs(c.amount)), 1)
   let r = 0.1
   for (let i = 0; i < 100; i++) {
     const f = npv(r), fp = dnpv(r)
     if (!isFinite(f) || !isFinite(fp) || fp === 0) break
     let rn = r - f / fp
     if (rn <= -0.9999) rn = (r - 0.9999) / 2 // damp toward the -100% floor
-    if (Math.abs(rn - r) < 1e-8) return rn
+    if (Math.abs(rn - r) < 1e-8) {
+      // Step-size convergence alone can stall off-root (e.g. pinned against
+      // the -100% floor) — accept only a true root, else fall to bisection.
+      if (Math.abs(npv(rn)) < 1e-6 * scale) return rn
+      break
+    }
     r = rn
   }
   // Bisection fallback — grow the upper bracket geometrically until the NPV
@@ -271,7 +304,6 @@ export function xirr(cashflows) {
   let flo = npv(lo), fhi = npv(hi)
   for (let g = 0; g < 40 && flo * fhi > 0 && hi < 1e6; g++) { hi *= 2; fhi = npv(hi) }
   if (!isFinite(flo) || !isFinite(fhi) || flo * fhi > 0) {
-    const scale = Math.max(...cashflows.map(c => Math.abs(c.amount)), 1)
     return isFinite(r) && Math.abs(npv(r)) < 1e-4 * scale ? r : NaN // scale-relative guard
   }
   for (let i = 0; i < 300; i++) {
@@ -306,13 +338,20 @@ export function sipReturn(series, lookbackDays = null, amount = 10000) {
   const daysInMonth = (y, mo) => new Date(y, mo + 1, 0).getDate()
   let y = startBound.getFullYear(), mo = startBound.getMonth()
   let cur = new Date(y, mo, Math.min(anchorDay, daysInMonth(y, mo)))
-  // step month-by-month; buy on first NAV on/after each scheduled date
-  while (cur <= end.date) {
+  // Step month-by-month; buy on first NAV on/after each scheduled date.
+  // Both bounds STRICT (< end.date): a buy on the terminal valuation date is
+  // degenerate (bought and redeemed the same instant — it cancels in XIRR but
+  // inflates invested/installments, e.g. a "1Y SIP" showing 13 × ₹10k).
+  // Skip buys that collapse onto an already-bought date (scheduled dates that
+  // pre-date the fund's history all match its first NAV — no double-buying).
+  let lastBuyMs = 0
+  while (cur < end.date) {
     const p = navAtOrAfter(series, cur)
-    if (p && p.date <= end.date) {
+    if (p && p.date < end.date && p.date.getTime() !== lastBuyMs) {
       units += amount / p.nav
       invested += amount
       cfs.push({ date: p.date, amount: -amount })
+      lastBuyMs = p.date.getTime()
     }
     mo += 1
     if (mo > 11) { mo = 0; y += 1 }
@@ -367,15 +406,22 @@ export function computeMetrics(series, rfAnnual = 0.0525) {
 
   const mDaily = mean(rets)
   const sDaily = sampleStd(rets)
-  const annVol = sDaily * Math.sqrt(TRADING_DAYS)
-  const annArith = mDaily * TRADING_DAYS // arithmetic annualized (Sharpe numerator base)
-  const rfDaily = rfAnnual / TRADING_DAYS
+  // Detect publication frequency: overnight/liquid funds publish NAVs most or
+  // all calendar days, so their per-observation returns are calendar accruals —
+  // annualizing by 252 understates return/vol (e.g. a 5.13%-CAGR overnight
+  // fund showed annArith 4.26%, Sharpe −6.5). Business-day series (~250
+  // obs/yr) stay on the standard 252 convention; anything else uses its
+  // observed cadence (see detectPeriodsPerYear).
+  const periodsPerYear = detectPeriodsPerYear(n, years)
+  const annVol = sDaily * Math.sqrt(periodsPerYear)
+  const annArith = mDaily * periodsPerYear // arithmetic annualized (Sharpe numerator base)
+  const rfDaily = rfAnnual / periodsPerYear
 
   // downside deviation, MAR = daily risk-free (consistent with Sharpe)
   let dsSum = 0
   for (const r of rets) { const d = Math.min(r - rfDaily, 0); dsSum += d * d }
   const downsideDevDaily = Math.sqrt(dsSum / n)
-  const annDownside = downsideDevDaily * Math.sqrt(TRADING_DAYS)
+  const annDownside = downsideDevDaily * Math.sqrt(periodsPerYear)
 
   // Floor the span before annualizing: a sub-quarter sample annualized as CAGR
   // produces absurd (e.g. quadrillion-%) figures.
@@ -423,6 +469,7 @@ export function computeMetrics(series, rfAnnual = 0.0525) {
 
   return {
     rfAnnual,
+    periodsPerYear, // annualization basis (252 business-day / 365 daily-NAV funds)
     period: {
       startDate: start.raw, endDate: end.raw,
       startNav: start.nav, endNav: end.nav,
@@ -488,8 +535,18 @@ function alignedSeries(fund, bench) {
 // Month-end NAVs -> monthly simple returns (last NAV of each calendar month).
 function monthlyReturns(dates, navs) {
   const byMonth = new Map()
-  dates.forEach((d, i) => byMonth.set(`${d.getFullYear()}-${d.getMonth()}`, navs[i])) // ascending → last wins
-  const vals = [...byMonth.values()]
+  dates.forEach((d, i) => byMonth.set(`${d.getFullYear()}-${d.getMonth()}`, { nav: navs[i], date: d })) // ascending → last wins
+  const entries = [...byMonth.values()]
+  // Drop a trailing PARTIAL month: when the series ends mid-month, a few-day
+  // stub would get full monthly weight in the capture ratios (a -4% crash in
+  // the first 3 days of a month becomes a whole "down month"). Morningstar
+  // uses complete months. 5-day tolerance: month-ends fall on weekends/holidays.
+  if (entries.length) {
+    const last = entries[entries.length - 1].date
+    const monthEnd = new Date(last.getFullYear(), last.getMonth() + 1, 0).getDate()
+    if (monthEnd - last.getDate() > 5) entries.pop()
+  }
+  const vals = entries.map(e => e.nav)
   const r = []
   for (let i = 1; i < vals.length; i++) r.push(vals[i] / vals[i - 1] - 1)
   return r
@@ -506,28 +563,34 @@ export function computeBenchmarkMetrics(fundSeries, benchSeries, rfAnnual = 0.05
   const { dates, f, b } = alignedSeries(fundSeries, benchSeries)
   if (f.length < 2) return null
   const fr = dailyReturns(f), br = dailyReturns(b)
-  const pairs = f.length
+  const pairs = fr.length // return pairs (the sheet labels it exactly that)
 
   const varB = sampleStd(br) ** 2
   const beta = varB > 0 ? covariance(fr, br) / varB : NaN
   const corr = correlation(fr, br)
   const rSquared = isFinite(corr) ? Math.min(1, corr * corr) : NaN // clamp float noise
 
-  const annF = mean(fr) * TRADING_DAYS
-  const annB = mean(br) * TRADING_DAYS
+  // same frequency detection as computeMetrics (aligned-pair cadence)
+  const yrsAll = yearsBetween(dates[0], dates[dates.length - 1])
+  const ppy = detectPeriodsPerYear(fr.length, yrsAll)
+  const annF = mean(fr) * ppy
+  const annB = mean(br) * ppy
   const alpha = annF - (rfAnnual + beta * (annB - rfAnnual))
   const treynor = beta !== 0 && isFinite(beta) ? (annF - rfAnnual) / beta : NaN
 
   const active = fr.map((x, i) => x - br[i])
-  const trackingError = sampleStd(active) * Math.sqrt(TRADING_DAYS)
-  const infoRatio = trackingError > 0 ? (mean(active) * TRADING_DAYS) / trackingError : NaN
+  const trackingError = sampleStd(active) * Math.sqrt(ppy)
+  const infoRatio = trackingError > 0 ? (mean(active) * ppy) / trackingError : NaN
 
-  // up/down capture: geometric over MONTHS where the benchmark was up / down
+  // up/down capture: geometric over MONTHS where the benchmark was up / down,
+  // ANNUALIZED (×12/k exponent) per the Morningstar convention — the ratio of
+  // raw cumulative returns drifts away from 100 as history length grows.
   const fm = monthlyReturns(dates, f), bm = monthlyReturns(dates, b)
   const cap = (mask) => {
     let prodF = 1, prodB = 1, k = 0
     for (let i = 0; i < bm.length; i++) { if (mask(bm[i])) { prodF *= 1 + fm[i]; prodB *= 1 + bm[i]; k++ } }
-    return { f: prodF - 1, b: prodB - 1, k }
+    if (!k) return { f: NaN, b: NaN, k }
+    return { f: prodF ** (12 / k) - 1, b: prodB ** (12 / k) - 1, k }
   }
   const up = cap(x => x > 0)
   const down = cap(x => x < 0)
@@ -535,11 +598,10 @@ export function computeBenchmarkMetrics(fundSeries, benchSeries, rfAnnual = 0.05
   const downCapture = down.b !== 0 ? (down.f / down.b) * 100 : NaN
 
   // raw excess return over benchmark: geometric (CAGR) over the common window
-  const yrs = yearsBetween(dates[0], dates[dates.length - 1])
   let excessReturn = NaN, cagrFund = NaN, cagrBench = NaN
-  if (yrs >= 0.25) {
-    cagrFund = (f[f.length - 1] / f[0]) ** (1 / yrs) - 1
-    cagrBench = (b[b.length - 1] / b[0]) ** (1 / yrs) - 1
+  if (yrsAll >= 0.25) {
+    cagrFund = (f[f.length - 1] / f[0]) ** (1 / yrsAll) - 1
+    cagrBench = (b[b.length - 1] / b[0]) ** (1 / yrsAll) - 1
     excessReturn = cagrFund - cagrBench
   }
 
@@ -573,13 +635,17 @@ function rollingWinRate(dates, f, b, windowDays) {
     let j = -1
     for (let k = i + 1; k < dates.length; k++) { if (dates[k].getTime() >= target) { j = k; break } }
     if (j < 0) continue
+    // same gap guard as rollingReturns: skip windows stretched by a NAV hole
+    if (dates[j].getTime() - target > 10 * 86400000) continue
     const fr = f[j] / f[i] - 1, br = b[j] / b[i] - 1
     if (isFinite(fr) && isFinite(br)) { tot++; if (fr > br) win++ }
   }
   return tot ? { rate: win / tot, windows: tot } : null
 }
 
-// % of calendar years where fund's intra-year return beat the benchmark's.
+// % of calendar years where the fund's return beat the benchmark's. Each
+// year's base is the PRIOR year-end observation (standard calendar-year
+// return); the first year in the data has no base and is skipped.
 function yearlyHitRate(dates, f, b) {
   const byYear = new Map()
   dates.forEach((d, i) => {
@@ -589,8 +655,9 @@ function yearlyHitRate(dates, f, b) {
   })
   let win = 0, tot = 0
   for (const { first, last } of byYear.values()) {
-    if (last <= first) continue
-    const fr = f[last] / f[first] - 1, br = b[last] / b[first] - 1
+    const base = first - 1 // last aligned obs of the previous year
+    if (base < 0 || last <= base) continue
+    const fr = f[last] / f[base] - 1, br = b[last] / b[base] - 1
     if (isFinite(fr) && isFinite(br)) { tot++; if (fr > br) win++ }
   }
   return tot ? { rate: win / tot, years: tot } : null
